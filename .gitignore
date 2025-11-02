@@ -1,0 +1,65 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+# Python 缓存文件
+pycache/
+*.py[cod]
+*$py.class
+# Python 构建与打包产物
+/build/
+/dist/
+/downloads/
+/lib/
+/lib64/
+/eggs/
+/.egg-info/
+/.egg
+/sdist/
+/wheels/
+*.manifest
+*.spec
+# 临时数据库
+*.db
+*.sqlite3
+db.sqlite3
+# VsCode
+/.vscode/
+# PyCharm
+/.idea/
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+# Vim
+*.swp
+*.swo
+# 日志与缓存
+*.log
+/.cache/
+/logs/
+# 测试与覆盖率报告
+/.pytest_cache/
+/coverage/
+.coverage
+*.cover
+# MacOS
+.DS_Store
+._*
+# Windows
+Thumbs.db
+ehthumbs.db
+desktop.ini
+# Linux
+*~
+
+# Virtual environments
+/.venv/
+.venv
+.env
+.env.*
+!.env.example
+
+nohup.out
