@@ -1,7 +1,7 @@
 # src/modules/admin/schemas.py
 
 from pydantic import BaseModel, ConfigDict
-from typing import Optional, List
+from typing import Optional, List, Literal
 from enum import Enum as PyEnum
 from datetime import datetime
 
@@ -132,6 +132,12 @@ class TechnicianSkillAssign(BaseModel):
     用于 '为技师分配技能' 接口
     """
     service_uid: str # 传入要分配的技能(服务)的 UID
+
+class UserRoleUpdate(BaseModel):
+    """
+    用于更新用户角色的模型
+    """
+    target_role: Literal['technician', 'admin']
 
 class ShiftCreate(BaseModel):
     """

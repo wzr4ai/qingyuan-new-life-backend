@@ -537,6 +537,64 @@ async def delete_resource(
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 @router.get(
+    "/customers",
+    response_model=List[schemas.UserBaseInfo],
+    summary="获取所有客户列表"
+)
+async def get_all_customers(
+    db: AsyncSession = Depends(get_db),
+    admin_user: User = Depends(get_current_admin_user)
+):
+    """
+    (Admin Only) 获取所有角色为 'customer' 的用户列表。
+    """
+    query = (
+        select(User)
+        .where(User.role == 'customer')
+        .order_by(User.nickname)
+    )
+    result = await db.execute(query)
+    customers = result.scalars().all()
+    return customers
+
+@router.put(
+    "/customers/{user_uid}/role",
+    response_model=schemas.UserBaseInfo,
+    summary="将客户升级为技师或管理员"
+)
+async def update_customer_role(
+    user_uid: str,
+    role_data: schemas.UserRoleUpdate,
+    db: AsyncSession = Depends(get_db),
+    admin_user: User = Depends(get_current_admin_user)
+):
+    """
+    (Admin Only) 将客户身份更新为技师或管理员。
+    """
+    query = select(User).where(User.uid == user_uid)
+    result = await db.execute(query)
+    db_user = result.scalars().first()
+
+    if not db_user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="用户不存在"
+        )
+
+    if db_user.role != 'customer':
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="仅支持从客户身份升级角色"
+        )
+
+    db_user.role = role_data.target_role
+    db.add(db_user)
+    await db.commit()
+    await db.refresh(db_user)
+
+    return db_user
+
+@router.get(
     "/technicians",
     response_model=List[schemas.TechnicianPublic],
     summary="获取所有技师及其技能列表"
@@ -604,10 +662,8 @@ async def assign_service_to_technician(
         
     # 3. 检查是否已分配
     if db_service in db_technician.service:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="该技师已掌握此技能，请勿重复添加"
-        )
+        await db.refresh(db_technician, ["service"])
+        return db_technician
         
     # 4. 分配技能 (SQLAlchemy 会自动处理多对多关联表)
     db_technician.service.append(db_service)
