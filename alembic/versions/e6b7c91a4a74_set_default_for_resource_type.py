@@ -9,6 +9,7 @@ from typing import Sequence, Union
 
 from alembic import op
 import sqlalchemy as sa
+from sqlalchemy import text, inspect
 
 
 # revision identifiers, used by Alembic.
@@ -19,19 +20,39 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    """Ensure resources.type has a default value."""
+    """Ensure resources.type column exists and defaults to 'room'."""
+    bind = op.get_bind()
+    inspector = inspect(bind)
+    columns = [col['name'] for col in inspector.get_columns('resources')]
     resource_enum = sa.Enum('technician', 'room', name='resource_type_enum')
-    with op.batch_alter_table('resources', schema=None) as batch_op:
-        batch_op.alter_column(
-            'type',
-            existing_type=resource_enum,
-            server_default='room'
+
+    if 'type' not in columns:
+        resource_enum.create(bind, checkfirst=True)
+        op.add_column(
+            'resources',
+            sa.Column('type', resource_enum, nullable=False, server_default='room')
         )
+    else:
+        with op.batch_alter_table('resources', schema=None) as batch_op:
+            batch_op.alter_column(
+                'type',
+                existing_type=resource_enum,
+                server_default='room'
+            )
+
+    op.execute(text("UPDATE resources SET type = 'room' WHERE type IS NULL OR type = ''"))
 
 
 def downgrade() -> None:
-    """Remove default value on resources.type."""
+    """Rollback default or column addition for resources.type."""
+    bind = op.get_bind()
+    inspector = inspect(bind)
+    columns = [col['name'] for col in inspector.get_columns('resources')]
     resource_enum = sa.Enum('technician', 'room', name='resource_type_enum')
+
+    if 'type' not in columns:
+        return
+
     with op.batch_alter_table('resources', schema=None) as batch_op:
         batch_op.alter_column(
             'type',
