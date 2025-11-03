@@ -1,9 +1,9 @@
 # src/modules/admin/router.py
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy import and_, or_
+from sqlalchemy import and_, or_, delete
 from typing import List, Optional
 from datetime import date
 
@@ -12,7 +12,8 @@ from src.shared.models.resource_models import Location, Service, Resource
 from src.shared.models.schedule_models import Shift
 from sqlalchemy.orm import joinedload
 from src.modules.auth.security import get_current_admin_user # 2. 导入管理员依赖
-from src.shared.models.user_models import User # 3. 导入 User (用于类型注解)
+from src.shared.models.user_models import User, technician_service_link_table # 3. 导入 User (用于类型注解)
+from src.shared.models.appointment_models import Appointment, AppointmentResourceLink
 from . import schemas # 4. 导入我们刚创建的 schemas
 
 # 我们创建一个专门用于管理后台的 'admin' 路由
@@ -116,6 +117,61 @@ async def update_location(
     
     return db_location
 
+@router.delete(
+    "/locations/{location_uid}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="删除指定地点"
+)
+async def delete_location(
+    location_uid: str,
+    db: AsyncSession = Depends(get_db),
+    admin_user: User = Depends(get_current_admin_user)
+):
+    """
+    (Admin Only) 删除一个地点。仅当地点未关联资源、排班或预约时允许删除。
+    """
+    query = select(Location).where(Location.uid == location_uid)
+    result = await db.execute(query)
+    db_location = result.scalars().first()
+
+    if not db_location:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="地点不存在"
+        )
+
+    has_resources = (await db.execute(
+        select(Resource.uid).where(Resource.location_id == location_uid).limit(1)
+    )).scalars().first()
+    if has_resources:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="请先删除该地点下的资源后再尝试删除地点"
+        )
+
+    has_shifts = (await db.execute(
+        select(Shift.uid).where(Shift.location_id == location_uid).limit(1)
+    )).scalars().first()
+    if has_shifts:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="该地点存在排班记录，无法删除"
+        )
+
+    has_appointments = (await db.execute(
+        select(Appointment.uid).where(Appointment.location_id == location_uid).limit(1)
+    )).scalars().first()
+    if has_appointments:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="该地点存在预约记录，无法删除"
+        )
+
+    await db.delete(db_location)
+    await db.commit()
+
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
 @router.post(
     "/services", 
     response_model=schemas.ServicePublic, 
@@ -203,6 +259,49 @@ async def update_service(
     await db.refresh(db_service)
     
     return db_service
+
+@router.delete(
+    "/services/{service_uid}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="删除指定服务项目"
+)
+async def delete_service(
+    service_uid: str,
+    db: AsyncSession = Depends(get_db),
+    admin_user: User = Depends(get_current_admin_user)
+):
+    """
+    (Admin Only) 删除一个服务项目。若仍存在预约或技师关联则拒绝删除。
+    """
+    query = select(Service).where(Service.uid == service_uid)
+    result = await db.execute(query)
+    db_service = result.scalars().first()
+
+    if not db_service:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="服务项目不存在"
+        )
+
+    has_appointments = (await db.execute(
+        select(Appointment.uid).where(Appointment.service_id == service_uid).limit(1)
+    )).scalars().first()
+    if has_appointments:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="该服务已关联预约记录，无法删除"
+        )
+
+    await db.execute(
+        delete(technician_service_link_table).where(
+            technician_service_link_table.c.service_id == service_uid
+        )
+    )
+
+    await db.delete(db_service)
+    await db.commit()
+
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 @router.post(
     "/resources",
@@ -335,6 +434,49 @@ async def update_resource(
     await db.refresh(db_resource, ["location"]) # 确保 location 关系被刷新
     
     return db_resource
+
+@router.delete(
+    "/resources/{resource_uid}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="删除物理资源(床位/房间)"
+)
+async def delete_resource(
+    resource_uid: str,
+    db: AsyncSession = Depends(get_db),
+    admin_user: User = Depends(get_current_admin_user)
+):
+    """
+    (Admin Only) 删除一个物理资源。如果资源仍与预约关联，则拒绝删除。
+    """
+    query = (
+        select(Resource)
+        .where(Resource.uid == resource_uid)
+        .options(joinedload(Resource.location))
+    )
+    result = await db.execute(query)
+    db_resource = result.scalars().first()
+
+    if not db_resource:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="资源不存在"
+        )
+
+    has_links = (await db.execute(
+        select(AppointmentResourceLink.uid).where(
+            AppointmentResourceLink.resource_id == resource_uid
+        ).limit(1)
+    )).scalars().first()
+    if has_links:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="该资源仍被预约记录占用，无法删除"
+        )
+
+    await db.delete(db_resource)
+    await db.commit()
+
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 @router.get(
     "/technicians",
