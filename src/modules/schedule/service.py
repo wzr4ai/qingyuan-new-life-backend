@@ -1,30 +1,79 @@
 # src/modules/schedule/service.py
 
+from collections import defaultdict
 from datetime import date, datetime, time, timedelta, timezone
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import joinedload
 from sqlalchemy import and_, or_
 
-from src.shared.models.resource_models import Service, Resource
+from src.shared.models.resource_models import Service, Resource, Location
 from src.shared.models.user_models import User
 from src.shared.models.schedule_models import Shift
 from src.shared.models.appointment_models import AppointmentTechnicianLink, AppointmentResourceLink, Appointment
 
 from .schemas import AppointmentCreate
 
-# 定义时间槽的步长（例如每 10 分钟检查一次）
-SLOT_INTERVAL_MINUTES = 10
-# 定义时区 (您服务器或业务所在时区，例如东八区)
-# 确保与数据库中存储的 timezone=True 匹配
-# 这是一个示例，请根据您的服务器配置调整
-LOCAL_TIMEZONE = timezone(timedelta(hours=8), 'Asia/Shanghai') 
+# 默认的时间槽长度（分钟）
+DEFAULT_SLOT_INTERVAL_MINUTES = 60
+# 预设的班次时段（预留扩展能力）
+DEFAULT_SHIFT_PERIODS = {
+    "morning": {"start": time(8, 30), "end": time(12, 30)},
+    "afternoon": {"start": time(14, 0), "end": time(18, 0)}
+}
+# 本地业务时区
+LOCAL_TIMEZONE = timezone(timedelta(hours=8), 'Asia/Shanghai')
+MAX_SHIFT_PLAN_DAYS = 30
+DEFAULT_CALENDAR_DAYS = 14
 
 # --- 辅助函数：时间范围重叠 ---
 def is_overlap(range1_start, range1_end, range2_start, range2_end):
     """检查两个时间范围 [start, end) 是否重叠"""
     # 确保比较的是同类型（例如都是 aware datetime）
     return range1_start < range2_end and range1_end > range2_start
+
+def get_slot_interval_minutes(service: Service) -> int:
+    """
+    获取服务对应的时间槽步长（分钟），预留未来扩展。
+    优先使用自定义字段，其次使用技师耗时，最后回退到默认配置。
+    """
+    custom_interval = getattr(service, "slot_interval_minutes", None)
+    if isinstance(custom_interval, int) and custom_interval > 0:
+        return custom_interval
+
+    duration = max(service.technician_operation_duration, 0)
+    if duration > 0:
+        return duration
+
+    return DEFAULT_SLOT_INTERVAL_MINUTES
+
+
+def compute_period_window(target_date: date, period: str) -> tuple[datetime, datetime]:
+    config = DEFAULT_SHIFT_PERIODS.get(period)
+    if not config:
+        raise ValueError(f"未知班次时段: {period}")
+    start_dt = datetime.combine(target_date, config["start"], tzinfo=LOCAL_TIMEZONE)
+    end_dt = datetime.combine(target_date, config["end"], tzinfo=LOCAL_TIMEZONE)
+    if end_dt <= start_dt:
+        raise ValueError("班次结束时间必须晚于开始时间")
+    return start_dt, end_dt
+
+
+def infer_shift_period(start: datetime, end: datetime) -> str | None:
+    if not start or not end:
+        return None
+    local_start = start.astimezone(LOCAL_TIMEZONE)
+    local_end = end.astimezone(LOCAL_TIMEZONE)
+    for key, config in DEFAULT_SHIFT_PERIODS.items():
+        expected_start = datetime.combine(local_start.date(), config["start"], tzinfo=LOCAL_TIMEZONE)
+        expected_end = datetime.combine(local_start.date(), config["end"], tzinfo=LOCAL_TIMEZONE)
+        if local_start == expected_start and local_end == expected_end:
+            return key
+    return None
+
+
+def normalize_local_date(dt: datetime) -> date:
+    return dt.astimezone(LOCAL_TIMEZONE).date()
 
 # --- 核心调度算法 ---
 
@@ -44,6 +93,9 @@ async def get_available_slots(
     
     if not db_service:
         raise Exception("服务项目不存在") # 稍后在 router 层转为 HTTPException
+
+    slot_step_minutes = get_slot_interval_minutes(db_service)
+    slot_step_delta = timedelta(minutes=slot_step_minutes)
 
     total_tech_duration = timedelta(minutes=(
         db_service.technician_operation_duration + db_service.buffer_time
@@ -83,9 +135,12 @@ async def get_available_slots(
         .where(
             User.uid.in_(capable_tech_uids),
             User.shifts.any(
-                Shift.location_id == location_uid,
-                Shift.start_time < day_end, # 排班开始 < 当天结束
-                Shift.end_time > day_start   # 排班结束 > 当天开始
+                and_(
+                    Shift.location_id == location_uid,
+                    Shift.is_cancelled == False,
+                    Shift.start_time < day_end,
+                    Shift.end_time > day_start
+                )
             )
         )
     )
@@ -98,7 +153,10 @@ async def get_available_slots(
     # ----------------------------------------------------
     # 步骤 4.2: 筛选合格的房间
     # ----------------------------------------------------
-    room_query = select(Resource).where(Resource.location_id == location_uid)
+    room_query = select(Resource).where(
+        Resource.location_id == location_uid,
+        Resource.services.any(Service.uid == service_uid)
+    )
     qualified_rooms = (await db.execute(room_query)).scalars().all()
     qualified_room_uids = [room.uid for room in qualified_rooms]
 
@@ -116,6 +174,9 @@ async def get_available_slots(
         AppointmentTechnicianLink.end_time > day_start
     )
     tech_bookings = (await db.execute(tech_bookings_query)).scalars().all()
+    tech_bookings_map = defaultdict(list)
+    for booking in tech_bookings:
+        tech_bookings_map[booking.technician_id].append(booking)
 
     # b. 房间的预约
     room_bookings_query = select(AppointmentResourceLink).where(
@@ -124,94 +185,108 @@ async def get_available_slots(
         AppointmentResourceLink.end_time > day_start
     )
     room_bookings = (await db.execute(room_bookings_query)).scalars().all()
+    room_bookings_map = defaultdict(list)
+    for booking in room_bookings:
+        room_bookings_map[booking.resource_id].append(booking)
 
     # ----------------------------------------------------
-    # 步骤 6: 迭代计算 (核心算法)
+    # 步骤 6: 基于排班生成候选时间槽
     # ----------------------------------------------------
-    available_slots = []
-    
-    # 我们只在技师的最早排班时间和最晚排班时间之间搜索
-    # (为简化，我们先从 8:00 到 20:00 搜索，后续可优化)
-    
-    # 确定当天的最早工作时间和最晚工作时间（基于所有排班）
-    all_shifts_today = []
+    candidate_slots: set[datetime] = set()
     for tech in qualified_technicians:
-        for shift in tech.shifts:
-            # 筛选出当天的排班
-            if is_overlap(shift.start_time, shift.end_time, day_start, day_end):
-                all_shifts_today.append(shift)
-    
-    if not all_shifts_today:
-        return [] # 虽然查到了技师，但他们的排班可能不在今天 (逻辑冗余，以防万一)
+        for shift in getattr(tech, "shifts", []):
+            if getattr(shift, "is_cancelled", False):
+                continue
+            if shift.location_id != location_uid:
+                continue
+            if shift.end_time <= day_start or shift.start_time >= day_end:
+                continue
 
-    # 找到搜索的起点和终点
-    search_start = max(day_start, min(s.start_time for s in all_shifts_today))
-    search_end = min(day_end, max(s.end_time for s in all_shifts_today))
+            window_start = max(shift.start_time.astimezone(LOCAL_TIMEZONE), day_start)
+            window_end = min(shift.end_time.astimezone(LOCAL_TIMEZONE), day_end)
+            if window_end <= window_start:
+                continue
 
-    current_slot_start = search_start
-    
-    while current_slot_start < search_end:
-        
-        # a. 计算此槽的技师和房间占用时段
-        slot_tech_end = current_slot_start + total_tech_duration
-        slot_room_end = current_slot_start + total_room_duration
-        
-        # b. 检查技师可用性
+            if total_tech_duration > timedelta(0):
+                last_start = window_end - total_tech_duration
+            else:
+                last_start = window_end - slot_step_delta
+
+            if last_start < window_start:
+                continue
+
+            current = window_start
+            while current <= last_start:
+                candidate_slots.add(current)
+                current += slot_step_delta
+
+    if not candidate_slots:
+        return []
+
+    available_slots: list[str] = []
+    for slot_start in sorted(candidate_slots):
+        slot_start = slot_start.astimezone(LOCAL_TIMEZONE)
+        slot_end_for_tech = slot_start + total_tech_duration
+        slot_end_for_room = slot_start + total_room_duration
+
+        if total_tech_duration == timedelta():
+            slot_end_for_tech = slot_start
+
+        if total_room_duration == timedelta():
+            slot_end_for_room = slot_start + slot_step_delta
+
         found_tech = False
         for tech in qualified_technicians:
-            # i. 检查技师是否正在排班
-            is_on_shift = False
-            for shift in tech.shifts:
-                if (shift.start_time <= current_slot_start and 
-                    shift.end_time >= slot_tech_end): # 技师的排班必须完全覆盖技师的操作时间
-                    is_on_shift = True
-                    break
-            
-            if not is_on_shift:
-                continue # 技师不在班，看下一个技师
-            
-            # ii. 检查技师是否已有预约
-            is_booked = False
-            for booking in tech_bookings:
-                if booking.technician_id == tech.uid:
-                    if is_overlap(booking.start_time, booking.end_time, 
-                                  current_slot_start, slot_tech_end):
-                        is_booked = True
-                        break # 技师被占用了，跳出预约循环
-            
-            if not is_booked:
-                found_tech = True # 找到了一个空闲且在班的技师！
-                break # 跳出技师循环
-        
+            on_shift = any(
+                shift.location_id == location_uid and
+                shift.start_time <= slot_start and
+                shift.end_time >= (slot_end_for_tech if total_tech_duration > timedelta() else slot_start)
+                for shift in getattr(tech, "shifts", [])
+            )
+            if not on_shift:
+                continue
+
+            bookings = tech_bookings_map.get(tech.uid, [])
+            is_booked = any(
+                is_overlap(
+                    booking.start_time,
+                    booking.end_time,
+                    slot_start,
+                    slot_end_for_tech if total_tech_duration > timedelta() else slot_start
+                )
+                for booking in bookings
+            )
+            if is_booked:
+                continue
+
+            found_tech = True
+            break
+
         if not found_tech:
-            # 没有技师可用，跳到下一个时间槽
-            current_slot_start += timedelta(minutes=SLOT_INTERVAL_MINUTES)
             continue
 
-        # c. 检查房间可用性
         found_room = False
         for room in qualified_rooms:
-            # i. 检查房间是否已有预约
-            is_booked = False
-            for booking in room_bookings:
-                if booking.resource_id == room.uid:
-                    if is_overlap(booking.start_time, booking.end_time, 
-                                  current_slot_start, slot_room_end):
-                        is_booked = True
-                        break # 房间被占用了，跳出预约循环
-            
-            if not is_booked:
-                found_room = True # 找到了一个空闲的房间！
-                break # 跳出房间循环
-        
-        # d. 决策
-        if found_tech and found_room:
-            # 格式化时间 (例如 "09:00")
-            slot_str = current_slot_start.strftime('%H:%M')
-            available_slots.append(slot_str)
-            
-        # 移到下一个时间槽
-        current_slot_start += timedelta(minutes=SLOT_INTERVAL_MINUTES)
+            bookings = room_bookings_map.get(room.uid, [])
+            is_booked = any(
+                is_overlap(
+                    booking.start_time,
+                    booking.end_time,
+                    slot_start,
+                    slot_end_for_room
+                )
+                for booking in bookings
+            )
+            if is_booked:
+                continue
+
+            found_room = True
+            break
+
+        if not found_room:
+            continue
+
+        available_slots.append(slot_start.strftime('%H:%M'))
 
     return available_slots
 
@@ -232,6 +307,9 @@ async def create_appointment(
     if not db_service:
         raise Exception("服务项目不存在")
 
+    slot_step_minutes = get_slot_interval_minutes(db_service)
+    slot_step_delta = timedelta(minutes=slot_step_minutes)
+
     total_tech_duration = timedelta(minutes=(
         db_service.technician_operation_duration + db_service.buffer_time
     ))
@@ -244,69 +322,68 @@ async def create_appointment(
     # ----------------------------------------------------
     appt_start = appt_data.start_time
     appt_tech_end = appt_start + total_tech_duration
+    if total_room_duration == timedelta():
+        total_room_duration = slot_step_delta
     appt_room_end = appt_start + total_room_duration
 
     # ----------------------------------------------------
-    # 步骤 4.1: (重构) 查找空闲的合格技师
+    # 步骤 4.1: 查找空闲的合格技师
     # ----------------------------------------------------
-    # (这是 get_available_slots 逻辑的简化版)
-    
     capable_tech_uids = [
         tech.uid for tech in (await db.execute(
             select(User).join(User.service).where(Service.uid == appt_data.service_uid)
         )).scalars().all()
     ]
-    
-    # (V6 逻辑) 找到在 'appt_start' 和 'appt_tech_end' 之间
-    # 1. 正在排班
-    # 2. 且没有被预约
-    # 的技师
-    
-    # 使用 FOR UPDATE (Pessimistic Locking) 锁定技师的预约表
-    # 这不是 SQL-Alchemy 异步的直接支持方式，
-    # 我们使用简化的“先检查后创建”逻辑，并依赖事务的原子性
-    
-    # 找到所有合格的技师 (在班 + 能做服务)
+
+    required_tech_end = appt_start + total_tech_duration
+    if total_tech_duration == timedelta():
+        required_tech_end = appt_start
+
     shift_query = (
-        select(User)
-        .join(User.shifts)
+        select(Shift)
+        .options(joinedload(Shift.technician))
         .where(
-            User.uid.in_(capable_tech_uids),
+            Shift.technician_id.in_(capable_tech_uids),
             Shift.location_id == appt_data.location_uid,
-            Shift.start_time <= appt_start, # 技师的排班必须在预约开始前 *开始*
-            Shift.end_time >= appt_tech_end   # 技师的排班必须在预约结束后 *结束*
+            Shift.is_cancelled == False,
+            Shift.start_time <= appt_start,
+            Shift.end_time >= required_tech_end
         )
+        .order_by(Shift.start_time)
     )
-    qualified_technicians = (await db.execute(shift_query)).scalars().unique().all()
-    
-    if not qualified_technicians:
+    candidate_shifts = (await db.execute(shift_query)).scalars().all()
+
+    if not candidate_shifts:
         raise Exception("没有技师在此时间排班或排班时间不足")
 
-    # 找到已被预约的技师
+    candidate_tech_ids = [shift.technician_id for shift in candidate_shifts]
+
     booked_techs_query = select(AppointmentTechnicianLink.technician_id).where(
-        AppointmentTechnicianLink.technician_id.in_([t.uid for t in qualified_technicians]),
-        # 检查时间重叠
-        AppointmentTechnicianLink.start_time < appt_tech_end,
+        AppointmentTechnicianLink.technician_id.in_(candidate_tech_ids),
+        AppointmentTechnicianLink.start_time < (required_tech_end if total_tech_duration > timedelta() else appt_start),
         AppointmentTechnicianLink.end_time > appt_start
     )
-    booked_tech_ids = (await db.execute(booked_techs_query)).scalars().all()
+    booked_tech_ids = set((await db.execute(booked_techs_query)).scalars().all())
 
-    # 找到第一个空闲的技师
-    available_technician: User | None = None
-    for tech in qualified_technicians:
-        if tech.uid not in booked_tech_ids:
-            available_technician = tech
-            break # 找到一个！
+    chosen_shift: Shift | None = None
+    for shift in candidate_shifts:
+        if shift.technician_id not in booked_tech_ids:
+            chosen_shift = shift
+            break
 
-    if not available_technician:
-        raise Exception("该时间段的技师已被预约，请选择其他时间") # 竞态条件失败
+    if not chosen_shift:
+        raise Exception("该时间段的技师已被预约，请选择其他时间")
+
+    available_technician = chosen_shift.technician
 
     # ----------------------------------------------------
     # 步骤 4.2: (重构) 查找空闲的合格房间
     # ----------------------------------------------------
-    qualified_rooms = (await db.execute(
-        select(Resource).where(Resource.location_id == appt_data.location_uid)
-    )).scalars().all()
+    qualified_rooms_query = select(Resource).where(
+        Resource.location_id == appt_data.location_uid,
+        Resource.services.any(Service.uid == appt_data.service_uid)
+    )
+    qualified_rooms = (await db.execute(qualified_rooms_query)).scalars().all()
 
     if not qualified_rooms:
         raise Exception("该地点没有可用的房间/床位")
@@ -372,3 +449,227 @@ async def create_appointment(
         await db.rollback()
         print(f"创建预约时发生严重错误: {e}")
         raise Exception(f"预约失败，请重试。错误: {e}")
+
+
+# --- 技师排班管理 ---
+
+async def list_schedule_locations(db: AsyncSession) -> list[Location]:
+    result = await db.execute(select(Location).order_by(Location.name))
+    return result.scalars().all()
+
+
+async def create_shifts_for_technician(
+    db: AsyncSession,
+    technician: User,
+    items: list,
+) -> list[Shift]:
+    from . import schemas as schedule_schemas
+
+    if not items:
+        return []
+
+    today = datetime.now(LOCAL_TIMEZONE).date()
+    max_date = today + timedelta(days=MAX_SHIFT_PLAN_DAYS)
+
+    normalized_items: list[schedule_schemas.TechnicianShiftCreateItem] = []
+    for item in items:
+        payload = (item if isinstance(item, schedule_schemas.TechnicianShiftCreateItem)
+                   else schedule_schemas.TechnicianShiftCreateItem.model_validate(item))
+
+        if payload.date < today or payload.date > max_date:
+            continue
+        normalized_items.append(payload)
+
+    if not normalized_items:
+        return []
+
+    location_uids = {payload.location_uid for payload in normalized_items}
+    location_map = {loc.uid: loc for loc in await list_schedule_locations(db)}
+    if not location_uids.issubset(location_map.keys()):
+        raise ValueError("存在无效的地点，无法创建排班")
+
+    window_start = min(payload.date for payload in normalized_items)
+    window_end = max(payload.date for payload in normalized_items)
+    range_start_dt = datetime.combine(window_start, time.min, tzinfo=LOCAL_TIMEZONE)
+    range_end_dt = datetime.combine(window_end, time.max, tzinfo=LOCAL_TIMEZONE)
+
+    existing_shifts_query = (
+        select(Shift)
+        .where(
+            Shift.technician_id == technician.uid,
+            Shift.is_cancelled == False,
+            Shift.start_time < range_end_dt,
+            Shift.end_time > range_start_dt,
+        )
+    )
+    existing_shifts = (await db.execute(existing_shifts_query)).scalars().all()
+
+    existing_index: dict[tuple[date, str], Shift] = {}
+    for shift in existing_shifts:
+        period = shift.period or infer_shift_period(shift.start_time, shift.end_time)
+        if not period:
+            continue
+        existing_index[(normalize_local_date(shift.start_time), period)] = shift
+
+    created_shifts: list[Shift] = []
+    for payload in normalized_items:
+        period_key = payload.period.value
+        key = (payload.date, period_key)
+        if key in existing_index:
+            continue
+
+        start_time, end_time = compute_period_window(payload.date, period_key)
+
+        conflict = False
+        for shift in existing_shifts:
+            if is_overlap(shift.start_time, shift.end_time, start_time, end_time):
+                conflict = True
+                break
+        if conflict:
+            continue
+
+        new_shift = Shift(
+            technician_id=technician.uid,
+            location_id=payload.location_uid,
+            start_time=start_time,
+            end_time=end_time,
+            period=period_key,
+            created_by_user_id=technician.uid,
+            locked_by_admin=False,
+            is_cancelled=False,
+        )
+        db.add(new_shift)
+        created_shifts.append(new_shift)
+
+    if not created_shifts:
+        await db.rollback()
+        return []
+
+    await db.commit()
+    for shift in created_shifts:
+        await db.refresh(shift, ["location"])
+    return created_shifts
+
+
+async def get_technician_shift_calendar(
+    db: AsyncSession,
+    technician: User,
+    days: int = DEFAULT_CALENDAR_DAYS,
+    include_cancelled: bool = False,
+):
+    from . import schemas as schedule_schemas
+
+    days = max(1, min(days, MAX_SHIFT_PLAN_DAYS))
+    today = datetime.now(LOCAL_TIMEZONE).date()
+    end_date = today + timedelta(days=days - 1)
+    range_start_dt = datetime.combine(today, time.min, tzinfo=LOCAL_TIMEZONE)
+    range_end_dt = datetime.combine(end_date, time.max, tzinfo=LOCAL_TIMEZONE)
+
+    shift_query = (
+        select(Shift)
+        .options(joinedload(Shift.location))
+        .where(
+            Shift.technician_id == technician.uid,
+            Shift.start_time < range_end_dt,
+            Shift.end_time > range_start_dt,
+        )
+    )
+    if not include_cancelled:
+        shift_query = shift_query.where(Shift.is_cancelled == False)
+
+    shifts = (await db.execute(shift_query)).scalars().all()
+
+    shift_map: dict[tuple[date, str], Shift] = {}
+    for shift in shifts:
+        if shift.is_cancelled:
+            continue
+        period = shift.period or infer_shift_period(shift.start_time, shift.end_time)
+        if not period:
+            continue
+        shift_map[(normalize_local_date(shift.start_time), period)] = shift
+
+    weekday_names = ['周一', '周二', '周三', '周四', '周五', '周六', '周日']
+    days_payload: list[schedule_schemas.TechnicianShiftDay] = []
+    for offset in range(days):
+        current_date = today + timedelta(days=offset)
+        weekday = weekday_names[current_date.weekday()]
+
+        slots = {}
+        for period_key in ['morning', 'afternoon']:
+            shift = shift_map.get((current_date, period_key))
+            if shift:
+                slots[period_key] = schedule_schemas.TechnicianShiftSlot(
+                    is_active=True,
+                    shift_uid=shift.uid,
+                    location_uid=shift.location_id,
+                    location_name=shift.location.name if shift.location else None,
+                    locked_by_admin=bool(shift.locked_by_admin)
+                )
+            else:
+                slots[period_key] = schedule_schemas.TechnicianShiftSlot(
+                    is_active=False,
+                    locked_by_admin=False
+                )
+
+        days_payload.append(
+            schedule_schemas.TechnicianShiftDay(
+                date=current_date,
+                weekday=weekday,
+                morning=slots['morning'],
+                afternoon=slots['afternoon']
+            )
+        )
+
+    location_options = [
+        schedule_schemas.LocationOption(uid=loc.uid, name=loc.name or '未命名地点')
+        for loc in await list_schedule_locations(db)
+    ]
+
+    return schedule_schemas.TechnicianShiftCalendar(
+        generated_at=datetime.now(LOCAL_TIMEZONE),
+        days=days_payload,
+        locations=location_options
+    )
+
+
+async def cancel_shift_by_admin(
+    db: AsyncSession,
+    shift_uid: str,
+    admin_user: User
+) -> Shift:
+    shift_query = (
+        select(Shift)
+        .options(joinedload(Shift.technician), joinedload(Shift.location))
+        .where(Shift.uid == shift_uid)
+    )
+    shift = (await db.execute(shift_query)).scalars().first()
+    if not shift:
+        raise ValueError("排班不存在")
+
+    if shift.is_cancelled:
+        return shift
+
+    # 检查是否存在未来预约
+    conflict_query = (
+        select(Appointment)
+        .join(AppointmentTechnicianLink)
+        .where(
+            AppointmentTechnicianLink.technician_id == shift.technician_id,
+            AppointmentTechnicianLink.start_time < shift.end_time,
+            AppointmentTechnicianLink.end_time > shift.start_time,
+            Appointment.status != 'cancelled'
+        )
+    )
+    conflict = (await db.execute(conflict_query)).scalars().first()
+    if conflict:
+        raise ValueError("该排班已有预约，请先处理相关预约后再取消")
+
+    shift.is_cancelled = True
+    shift.cancelled_at = datetime.now(LOCAL_TIMEZONE)
+    shift.cancelled_by_user_id = admin_user.uid
+    shift.locked_by_admin = True
+
+    db.add(shift)
+    await db.commit()
+    await db.refresh(shift, ["technician", "location"])
+    return shift

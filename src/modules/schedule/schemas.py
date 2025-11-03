@@ -1,8 +1,9 @@
 # src/modules/schedule/schemas.py
 
+from enum import Enum
 from pydantic import BaseModel, ConfigDict
-from typing import List, Dict
-from datetime import date, datetime, time
+from typing import List, Dict, Optional
+from datetime import date, datetime
 
 class AvailabilityResponse(BaseModel):
     """
@@ -53,3 +54,44 @@ class AppointmentPublic(BaseModel):
             service_uid=appt.service_id,
             location_uid=appt.location_id
         )
+
+
+class ShiftPeriod(str, Enum):
+    morning = "morning"
+    afternoon = "afternoon"
+
+
+class TechnicianShiftSlot(BaseModel):
+    is_active: bool
+    shift_uid: Optional[str] = None
+    location_uid: Optional[str] = None
+    location_name: Optional[str] = None
+    locked_by_admin: bool = False
+
+
+class TechnicianShiftDay(BaseModel):
+    date: date
+    weekday: str
+    morning: TechnicianShiftSlot
+    afternoon: TechnicianShiftSlot
+
+
+class LocationOption(BaseModel):
+    uid: str
+    name: str
+
+
+class TechnicianShiftCalendar(BaseModel):
+    generated_at: datetime
+    days: List[TechnicianShiftDay]
+    locations: List[LocationOption]
+
+
+class TechnicianShiftCreateItem(BaseModel):
+    date: date
+    period: ShiftPeriod
+    location_uid: str
+
+
+class TechnicianShiftCreateRequest(BaseModel):
+    items: List[TechnicianShiftCreateItem]

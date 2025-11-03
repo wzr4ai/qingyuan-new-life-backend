@@ -3,7 +3,9 @@
 from pydantic import BaseModel, ConfigDict, Field, AliasChoices
 from typing import Optional, List, Literal
 from enum import Enum as PyEnum
-from datetime import datetime
+from datetime import datetime, date
+
+from src.modules.schedule.schemas import ShiftPeriod
 
 # --- Location Schemas ---
 
@@ -144,19 +146,30 @@ class UserRoleUpdate(BaseModel):
 
 class ShiftCreate(BaseModel):
     """
-    用于 '创建排班' 接口
+    用于 '创建排班' 接口 (基于班次的排班请求)
     """
     technician_uid: str
     location_uid: str
-    start_time: datetime # 例如: "2025-10-27T08:30:00+08:00"
-    end_time: datetime   # 例如: "2025-10-27T12:00:00+08:00"
+    date: date
+    period: ShiftPeriod
 
-    # Pydantic v2 验证器: 确保结束时间晚于开始时间
-    from pydantic import model_validator
-    @model_validator(mode='after')
-    def check_times(self) -> 'ShiftCreate':
-        if self.start_time and self.end_time and self.start_time >= self.end_time:
-            raise ValueError("排班结束时间 (end_time) 必须晚于开始时间 (start_time)")
+    from pydantic import field_validator, model_validator
+
+    @field_validator("date")
+    @classmethod
+    def ensure_future_date(cls, value: date) -> date:
+        if value < date.today():
+            raise ValueError("排班日期不能早于今天")
+        return value
+
+    @model_validator(mode="after")
+    def normalize_period(self) -> "ShiftCreate":
+        # 兼容字符串传入
+        if isinstance(self.period, str):
+            try:
+                self.period = ShiftPeriod(self.period)
+            except ValueError as exc:
+                raise ValueError("无效的班次时段") from exc
         return self
 
 class ShiftPublic(BaseModel):
@@ -166,9 +179,15 @@ class ShiftPublic(BaseModel):
     uid: str
     start_time: datetime
     end_time: datetime
+    period: Optional[str] = None
+    locked_by_admin: bool = False
+    is_cancelled: bool = False
+    cancelled_at: Optional[datetime] = None
+    created_by_user_id: Optional[str] = None
+    cancelled_by_user_id: Optional[str] = None
     
     # 嵌套显示该排班所属的技师和地点
     technician: UserBaseInfo 
     location: LocationPublic 
     
-    model_config = ConfigDict(from_attributes=True)
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)

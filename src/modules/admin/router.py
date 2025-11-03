@@ -1,11 +1,11 @@
 # src/modules/admin/router.py
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy import and_, or_, delete
 from typing import List, Optional
-from datetime import date
+from datetime import date, datetime, time
 
 from src.core.database import get_db
 from src.shared.models.resource_models import (
@@ -20,6 +20,8 @@ from src.modules.auth.security import get_current_admin_user # 2. 导入管理�
 from src.shared.models.user_models import User, technician_service_link_table # 3. 导入 User (用于类型注解)
 from src.shared.models.appointment_models import Appointment, AppointmentResourceLink
 from . import schemas # 4. 导入我们刚创建的 schemas
+from src.modules.schedule import service as schedule_service
+from src.modules.schedule import schemas as schedule_schemas
 
 # 我们创建一个专门用于管理后台的 'admin' 路由
 # 它不带 prefix，我们将在 main.py 中统一添加
@@ -759,13 +761,22 @@ async def create_shift(
     if not db_location:
         raise HTTPException(status_code=404, detail="地点不存在")
 
+    try:
+        start_time, end_time = schedule_service.compute_period_window(
+            shift_data.date,
+            shift_data.period.value if isinstance(shift_data.period, schedule_schemas.ShiftPeriod) else shift_data.period
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
     # 3. (关键) 检查该技师的排班是否重叠
     # 查找该技师已有的、与新排班时间 [start, end] 有任何重叠的排班
     # 重叠条件: (existing.start < new.end) AND (existing.end > new.start)
     overlap_query = select(Shift).where(
         Shift.technician_id == shift_data.technician_uid,
-        Shift.start_time < shift_data.end_time, # 已有排班的开始 < 新排班的结束
-        Shift.end_time > shift_data.start_time   # 已有排班的结束 > 新排班的开始
+        Shift.is_cancelled == False,
+        Shift.start_time < end_time, # 已有排班的开始 < 新排班的结束
+        Shift.end_time > start_time   # 已有排班的结束 > 新排班的开始
     )
     existing_shift = (await db.execute(overlap_query)).scalars().first()
     
@@ -779,16 +790,17 @@ async def create_shift(
     new_shift = Shift(
         technician_id=shift_data.technician_uid,
         location_id=shift_data.location_uid,
-        start_time=shift_data.start_time,
-        end_time=shift_data.end_time,
-        # 手动关联对象以便 Pydantic 返回时能正确嵌套
-        technician=db_technician, 
+        start_time=start_time,
+        end_time=end_time,
+        period=(shift_data.period.value if isinstance(shift_data.period, schedule_schemas.ShiftPeriod) else shift_data.period),
+        created_by_user_id=admin_user.uid,
+        locked_by_admin=True,
+        technician=db_technician,
         location=db_location
     )
     db.add(new_shift)
     await db.commit()
-    # refresh 不是必须的，因为我们已经手动关联了
-    # await db.refresh(new_shift, ["technician", "location"]) 
+    await db.refresh(new_shift, ["technician", "location"])
     
     return new_shift
 
@@ -802,6 +814,7 @@ async def get_shifts(
     technician_uid: Optional[str] = None,
     start_date: Optional[date] = None,
     end_date: Optional[date] = None,
+    include_cancelled: bool = False,
     db: AsyncSession = Depends(get_db),
     admin_user: User = Depends(get_current_admin_user) # <-- 保护接口
 ):
@@ -822,41 +835,60 @@ async def get_shifts(
     if technician_uid:
         query = query.where(Shift.technician_id == technician_uid)
     if start_date:
-        # 查询排班结束时间 >= start_date
-        query = query.where(Shift.end_time >= start_date) 
+        start_dt = datetime.combine(start_date, time.min, tzinfo=schedule_service.LOCAL_TIMEZONE)
+        query = query.where(Shift.end_time >= start_dt)
     if end_date:
-        # 查询排班开始时间 <= end_date
-        query = query.where(Shift.start_time <= end_date)
+        end_dt = datetime.combine(end_date, time.max, tzinfo=schedule_service.LOCAL_TIMEZONE)
+        query = query.where(Shift.start_time <= end_dt)
+    if not include_cancelled:
+        query = query.where(Shift.is_cancelled == False)
 
     result = await db.execute(query)
     shifts = result.scalars().unique().all()
     
     return shifts
 
-@router.delete(
-    "/shifts/{shift_uid}",
-    status_code=status.HTTP_204_NO_CONTENT,
-    summary="删除排班 (V6)"
+
+@router.get(
+    "/technicians/{technician_uid}/shift-calendar",
+    response_model=schedule_schemas.TechnicianShiftCalendar,
+    summary="管理员查看技师排班日历"
 )
-async def delete_shift(
+async def get_technician_shift_calendar_for_admin(
+    technician_uid: str,
+    days: int = Query(14, ge=1, le=schedule_service.MAX_SHIFT_PLAN_DAYS, description="返回未来多少天的排班"),
+    include_cancelled: bool = Query(False, description="是否包含已取消排班"),
+    db: AsyncSession = Depends(get_db),
+    admin_user: User = Depends(get_current_admin_user)
+):
+    technician = (await db.execute(
+        select(User).where(User.uid == technician_uid)
+    )).scalars().first()
+
+    if not technician or technician.role not in ("technician", "admin"):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="技师不存在")
+
+    return await schedule_service.get_technician_shift_calendar(
+        db=db,
+        technician=technician,
+        days=days,
+        include_cancelled=include_cancelled
+    )
+
+
+@router.patch(
+    "/shifts/{shift_uid}/cancel",
+    response_model=schemas.ShiftPublic,
+    summary="取消排班"
+)
+async def cancel_shift(
     shift_uid: str,
     db: AsyncSession = Depends(get_db),
-    admin_user: User = Depends(get_current_admin_user) # <-- 保护接口
+    admin_user: User = Depends(get_current_admin_user)
 ):
-    """
-    (Admin Only) 删除一个排班记录。
-    """
-    query = select(Shift).where(Shift.uid == shift_uid)
-    result = await db.execute(query)
-    db_shift = result.scalars().first()
+    try:
+        shift = await schedule_service.cancel_shift_by_admin(db, shift_uid, admin_user)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
-    if not db_shift:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="排班记录不存在"
-        )
-        
-    await db.delete(db_shift)
-    await db.commit()
-    
-    return None # 204 状态码不应返回任何内容
+    return shift

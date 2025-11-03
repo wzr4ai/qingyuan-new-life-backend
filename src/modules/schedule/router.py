@@ -85,3 +85,72 @@ async def create_new_appointment(
             status_code=status.HTTP_409_CONFLICT, # 409 Conflict (资源冲突)
             detail=str(e) or "预约失败，该时间段可能刚被预订"
         )
+
+
+@router.get(
+    "/my-shifts",
+    response_model=schemas.TechnicianShiftCalendar,
+    summary="技师查看未来排班"
+)
+async def get_my_shifts(
+    days: int = Query(14, ge=1, le=60, description="返回未来多少天的排班"),
+    include_cancelled: bool = Query(False, description="是否包含已取消的排班"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    if current_user.role not in ("technician", "admin"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="仅技师或管理员可查看排班")
+
+    return await schedule_service.get_technician_shift_calendar(
+        db=db,
+        technician=current_user,
+        days=days,
+        include_cancelled=include_cancelled
+    )
+
+
+@router.post(
+    "/my-shifts",
+    response_model=schemas.TechnicianShiftCalendar,
+    status_code=status.HTTP_201_CREATED,
+    summary="技师新增排班"
+)
+async def create_my_shifts(
+    payload: schemas.TechnicianShiftCreateRequest,
+    days: int = Query(14, ge=1, le=60, description="返回未来多少天的排班"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    if current_user.role not in ("technician", "admin"):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="仅技师或管理员可操作排班")
+
+    try:
+        await schedule_service.create_shifts_for_technician(
+            db=db,
+            technician=current_user,
+            items=payload.items,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    return await schedule_service.get_technician_shift_calendar(
+        db=db,
+        technician=current_user,
+        days=days
+    )
+
+
+@router.get(
+    "/locations",
+    response_model=List[schemas.LocationOption],
+    summary="获取排班可用地点列表"
+)
+async def get_schedule_locations(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    locations = await schedule_service.list_schedule_locations(db)
+    return [
+        schemas.LocationOption(uid=loc.uid, name=loc.name or '未命名地点')
+        for loc in locations
+    ]
