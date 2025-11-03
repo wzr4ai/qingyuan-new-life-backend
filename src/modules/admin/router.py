@@ -230,9 +230,15 @@ async def create_resource(
         )
         
     # 2. 创建 Resource 并直接关联 Location 对象
+    incoming_type = resource_data.type
+    if isinstance(incoming_type, schemas.ResourceType):
+        resolved_type = incoming_type.value
+    else:
+        resolved_type = str(incoming_type or schemas.ResourceType.room.value)
+
     new_resource = Resource(
         name=resource_data.name,
-        type=resource_data.type.value,
+        type=resolved_type,
         location=db_location  # <-- 直接关联对象
     )
     db.add(new_resource)
@@ -315,8 +321,11 @@ async def update_resource(
     
     # 更新其他字段 (例如 name)
     for key, value in update_data.items():
-        if key == "type" and isinstance(value, schemas.ResourceType):
-            setattr(db_resource, key, value.value)
+        if key == "type":
+            if isinstance(value, schemas.ResourceType):
+                setattr(db_resource, key, value.value)
+            else:
+                setattr(db_resource, key, str(value))
         else:
             setattr(db_resource, key, value)
         
