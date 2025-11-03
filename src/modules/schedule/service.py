@@ -78,6 +78,13 @@ def infer_shift_period(start: datetime, end: datetime) -> str | None:
 def normalize_local_date(dt: datetime) -> date:
     return dt.astimezone(LOCAL_TIMEZONE).date()
 
+
+def normalize_slot_time(dt: datetime) -> str:
+    local_dt = dt.astimezone(LOCAL_TIMEZONE)
+    minute_bucket = (local_dt.minute // 30) * 30
+    normalized = local_dt.replace(minute=minute_bucket, second=0, microsecond=0)
+    return normalized.strftime('%H:%M')
+
 # --- 核心调度算法 ---
 
 async def get_available_slots(
@@ -723,24 +730,38 @@ async def get_location_day_summary(
         normalized_date = normalize_local_date(shift.start_time)
         period = shift.period or infer_shift_period(shift.start_time, shift.end_time)
         period_map = active_map.setdefault(normalized_date, {})
+
+        def append_slot(period_key: str):
+            info = period_map.setdefault(period_key, {
+                'active': True,
+                'slots': set()
+            })
+            info['active'] = True
+            info['slots'].add(
+                normalize_slot_time(shift.start_time)
+            )
+
         if period in ('morning', 'afternoon'):
-            period_map[period] = True
+            append_slot(period)
         else:
-            # fallback: mark both periods active when we cannot infer
-            period_map['morning'] = True
-            period_map['afternoon'] = True
+            append_slot('morning')
+            append_slot('afternoon')
 
     summary: list[schedule_schemas.LocationDay] = []
     for offset in range(days):
         current_date = today + timedelta(days=offset)
         period_map = active_map.get(current_date, {})
+        morning_info = period_map.get('morning', {'active': False, 'slots': set()})
+        afternoon_info = period_map.get('afternoon', {'active': False, 'slots': set()})
         summary.append(
             schedule_schemas.LocationDay(
                 date=current_date,
                 weekday=WEEKDAY_NAMES[current_date.weekday()],
                 has_any_shift=bool(period_map),
-                morning_active=period_map.get('morning', False),
-                afternoon_active=period_map.get('afternoon', False)
+                morning_active=morning_info['active'],
+                afternoon_active=afternoon_info['active'],
+                morning_slots=sorted(morning_info['slots']),
+                afternoon_slots=sorted(afternoon_info['slots'])
             )
         )
 

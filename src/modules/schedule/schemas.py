@@ -94,6 +94,8 @@ class LocationDay(BaseModel):
     has_any_shift: bool
     morning_active: bool = False
     afternoon_active: bool = False
+    morning_slots: List[str] = Field(default_factory=list)
+    afternoon_slots: List[str] = Field(default_factory=list)
 
 
 class ServiceOption(BaseModel):
