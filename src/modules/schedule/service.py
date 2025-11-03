@@ -462,6 +462,8 @@ async def create_shifts_for_technician(
     db: AsyncSession,
     technician: User,
     items: list,
+    created_by_user: User | None = None,
+    lock_created_by_admin: bool = False,
 ) -> list[Shift]:
     from . import schemas as schedule_schemas
 
@@ -534,8 +536,8 @@ async def create_shifts_for_technician(
             start_time=start_time,
             end_time=end_time,
             period=period_key,
-            created_by_user_id=technician.uid,
-            locked_by_admin=False,
+            created_by_user_id=(created_by_user.uid if created_by_user else technician.uid),
+            locked_by_admin=lock_created_by_admin,
             is_cancelled=False,
         )
         db.add(new_shift)

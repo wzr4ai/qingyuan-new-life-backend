@@ -804,6 +804,46 @@ async def create_shift(
     
     return new_shift
 
+
+@router.post(
+    "/technicians/{technician_uid}/shifts/bulk",
+    response_model=schedule_schemas.TechnicianShiftCalendar,
+    summary="批量创建排班"
+)
+async def bulk_create_shifts(
+    technician_uid: str,
+    payload: schedule_schemas.TechnicianShiftCreateRequest,
+    days: int = Query(14, ge=1, le=schedule_service.MAX_SHIFT_PLAN_DAYS, description="返回未来多少天的排班"),
+    db: AsyncSession = Depends(get_db),
+    admin_user: User = Depends(get_current_admin_user)
+):
+    technician = (await db.execute(
+        select(User).where(User.uid == technician_uid)
+    )).scalars().first()
+
+    if not technician or technician.role not in ('technician', 'admin'):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="技师用户不存在")
+
+    if not payload.items:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="请选择至少一个班次")
+
+    try:
+        await schedule_service.create_shifts_for_technician(
+            db=db,
+            technician=technician,
+            items=payload.items,
+            created_by_user=admin_user,
+            lock_created_by_admin=True
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    return await schedule_service.get_technician_shift_calendar(
+        db=db,
+        technician=technician,
+        days=days
+    )
+
 @router.get(
     "/shifts",
     response_model=List[schemas.ShiftPublic],
