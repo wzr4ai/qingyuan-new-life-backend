@@ -2,12 +2,14 @@
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.future import select
 from typing import List
 from datetime import date
 
 from src.core.database import get_db
 from src.modules.auth.security import get_current_user # 1. 导入 get_current_user (普通用户即可)
 from src.shared.models.user_models import User
+from src.shared.models.resource_models import Service
 from . import schemas
 from . import service as schedule_service
 
@@ -154,3 +156,87 @@ async def get_schedule_locations(
         schemas.LocationOption(uid=loc.uid, name=loc.name or '未命名地点')
         for loc in locations
     ]
+
+
+@router.get(
+    "/location-days",
+    response_model=List[schemas.LocationDay],
+    summary="获取地点可排班日期"
+)
+async def get_location_days(
+    location_uid: str = Query(..., description="地点UID"),
+    days: int = Query(14, ge=1, le=schedule_service.MAX_SHIFT_PLAN_DAYS, description="返回未来多少天"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    return await schedule_service.get_location_day_summary(
+        db=db,
+        location_uid=location_uid,
+        days=days
+    )
+
+
+@router.get(
+    "/location-services",
+    response_model=List[schemas.ServiceOption],
+    summary="获取地点可用服务"
+)
+async def get_location_services(
+    location_uid: str = Query(..., description="地点UID"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    return await schedule_service.list_service_options_for_location(db, location_uid)
+
+
+@router.post(
+    "/location-technicians",
+    response_model=List[schemas.TechnicianOption],
+    summary="获取地点技师偏好列表"
+)
+async def get_location_technicians(
+    payload: schemas.TechnicianFilterRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    return await schedule_service.list_technicians_for_location_services(
+        db=db,
+        location_uid=payload.location_uid,
+        service_uids=payload.service_uids
+    )
+
+
+@router.post(
+    "/package-availability",
+    response_model=schemas.PackageAvailabilityResponse,
+    summary="查询服务组合可用时间"
+)
+async def get_package_availability(
+    payload: schemas.PackageAvailabilityRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    try:
+        services_query = select(Service).where(Service.uid.in_(payload.ordered_service_uids))
+        service_result = await db.execute(services_query)
+        service_map = {service.uid: service for service in service_result.scalars().all()}
+
+        ordered_services = []
+        for service_uid in payload.ordered_service_uids:
+            service = service_map.get(service_uid)
+            if not service:
+                raise ValueError(f"服务 {service_uid} 不存在")
+            ordered_services.append(service)
+
+        slots = await schedule_service.get_available_slots_for_package(
+            db=db,
+            location_uid=payload.location_uid,
+            ordered_services=ordered_services,
+            target_date=payload.target_date,
+            preferred_technician_uid=payload.preferred_technician_uid,
+            holds=payload.holds
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    return schemas.PackageAvailabilityResponse(available_slots=slots)

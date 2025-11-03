@@ -1,7 +1,7 @@
 # src/modules/schedule/schemas.py
 
 from enum import Enum
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from typing import List, Dict, Optional
 from datetime import date, datetime
 
@@ -88,6 +88,29 @@ class TechnicianShiftCalendar(BaseModel):
     locations: List[LocationOption]
 
 
+class LocationDay(BaseModel):
+    date: date
+    weekday: str
+    has_any_shift: bool
+
+
+class ServiceOption(BaseModel):
+    uid: str
+    name: str
+    technician_duration: int
+    room_duration: int
+    buffer_time: int
+    is_active: bool = True
+
+
+class TechnicianOption(BaseModel):
+    uid: str
+    nickname: Optional[str] = None
+    phone: Optional[str] = None
+    is_available: bool = True
+    disabled_reason: Optional[str] = None
+
+
 class TechnicianShiftCreateItem(BaseModel):
     date: date
     period: ShiftPeriod
@@ -96,3 +119,44 @@ class TechnicianShiftCreateItem(BaseModel):
 
 class TechnicianShiftCreateRequest(BaseModel):
     items: List[TechnicianShiftCreateItem]
+
+
+class ScheduleCartHold(BaseModel):
+    start_time: datetime
+    end_time: datetime
+    technician_uid: Optional[str] = None
+    resource_uid: Optional[str] = None
+
+
+class TechnicianFilterRequest(BaseModel):
+    location_uid: str
+    service_uids: List[str]
+
+
+class PackageAvailabilityRequest(BaseModel):
+    location_uid: str
+    target_date: date
+    ordered_service_uids: List[str]
+    preferred_technician_uid: Optional[str] = None
+    holds: List[ScheduleCartHold] = Field(default_factory=list)
+
+
+class PackageSlotTechnician(BaseModel):
+    uid: str
+    nickname: Optional[str] = None
+    phone: Optional[str] = None
+
+
+class PackageSlotResource(BaseModel):
+    uid: str
+    name: Optional[str] = None
+
+
+class PackageAvailabilitySlot(BaseModel):
+    start_time: datetime
+    technician: Optional[PackageSlotTechnician] = None
+    resource: Optional[PackageSlotResource] = None
+
+
+class PackageAvailabilityResponse(BaseModel):
+    available_slots: List[PackageAvailabilitySlot]
