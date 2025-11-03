@@ -92,6 +92,8 @@ class LocationDay(BaseModel):
     date: date
     weekday: str
     has_any_shift: bool
+    morning_active: bool = False
+    afternoon_active: bool = False
 
 
 class ServiceOption(BaseModel):

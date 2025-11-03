@@ -706,7 +706,7 @@ async def get_location_day_summary(
     range_end_dt = datetime.combine(end_date, time.max, tzinfo=LOCAL_TIMEZONE)
 
     shift_rows = await db.execute(
-        select(Shift.start_time)
+        select(Shift)
         .where(
             Shift.location_id == location_uid,
             Shift.is_cancelled == False,
@@ -714,20 +714,33 @@ async def get_location_day_summary(
             Shift.end_time > range_start_dt,
         )
     )
-    active_dates = {
-        normalize_local_date(row[0])
-        for row in shift_rows
-        if row[0] is not None
-    }
+    shifts = shift_rows.scalars().all()
+
+    active_map: dict[date, dict[str, bool]] = {}
+    for shift in shifts:
+        if not shift.start_time or not shift.end_time:
+            continue
+        normalized_date = normalize_local_date(shift.start_time)
+        period = shift.period or infer_shift_period(shift.start_time, shift.end_time)
+        period_map = active_map.setdefault(normalized_date, {})
+        if period in ('morning', 'afternoon'):
+            period_map[period] = True
+        else:
+            # fallback: mark both periods active when we cannot infer
+            period_map['morning'] = True
+            period_map['afternoon'] = True
 
     summary: list[schedule_schemas.LocationDay] = []
     for offset in range(days):
         current_date = today + timedelta(days=offset)
+        period_map = active_map.get(current_date, {})
         summary.append(
             schedule_schemas.LocationDay(
                 date=current_date,
                 weekday=WEEKDAY_NAMES[current_date.weekday()],
-                has_any_shift=current_date in active_dates
+                has_any_shift=bool(period_map),
+                morning_active=period_map.get('morning', False),
+                afternoon_active=period_map.get('afternoon', False)
             )
         )
 
