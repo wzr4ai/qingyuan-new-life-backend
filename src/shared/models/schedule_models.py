@@ -70,7 +70,8 @@ class Shift(Base):
     # 关联到技师 (User)
     technician: Mapped["User"] = relationship(
         "User", 
-        back_populates="shifts"
+        back_populates="shifts",
+        foreign_keys=[technician_id]
     )
     created_by: Mapped["User"] = relationship(
         "User",

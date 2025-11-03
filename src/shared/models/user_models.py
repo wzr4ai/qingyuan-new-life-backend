@@ -17,6 +17,10 @@ from sqlalchemy import (
 from sqlalchemy.orm import relationship, Mapped, mapped_column
 from src.core.database import Base  # <-- 导入 Base
 import ulid
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .schedule_models import Shift
 
 # 定义技师和服务的 多对多 关联表
 technician_service_link_table = Table(
@@ -79,7 +83,8 @@ class User(Base):
     shifts: Mapped[list["Shift"]] = relationship(
         "Shift",
         back_populates="technician",
-        cascade="all, delete-orphan"
+        cascade="all, delete-orphan",
+        foreign_keys="Shift.technician_id"
     )
     
     created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), server_default=func.now())
