@@ -243,7 +243,8 @@ async def create_resource(
     )
     db.add(new_resource)
     await db.commit()
-    await db.refresh(new_resource)
+    # 确保 location 关系在返回前已加载，避免 Lazy Load 触发 MissingGreenlet
+    await db.refresh(new_resource, attribute_names=["location"])
     
     # 3. 返回。因为 location 关系是在 session 中被赋的，
     # Pydantic (with from_attributes=True) 可以正确地嵌套 LocationPublic
