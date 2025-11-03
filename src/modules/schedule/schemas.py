@@ -67,6 +67,7 @@ class TechnicianShiftSlot(BaseModel):
     location_uid: Optional[str] = None
     location_name: Optional[str] = None
     locked_by_admin: bool = False
+    has_bookings: bool = False
 
 
 class TechnicianShiftDay(BaseModel):

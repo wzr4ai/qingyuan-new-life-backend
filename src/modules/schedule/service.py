@@ -581,6 +581,30 @@ async def get_technician_shift_calendar(
 
     shifts = (await db.execute(shift_query)).scalars().all()
 
+    booking_intervals: list[tuple[datetime, datetime]] = []
+    if shifts:
+        bookings_query = (
+            select(
+                AppointmentTechnicianLink.start_time,
+                AppointmentTechnicianLink.end_time
+            )
+            .join(Appointment, Appointment.uid == AppointmentTechnicianLink.appointment_id)
+            .where(
+                AppointmentTechnicianLink.technician_id == technician.uid,
+                AppointmentTechnicianLink.start_time < range_end_dt,
+                AppointmentTechnicianLink.end_time > range_start_dt,
+                Appointment.status != 'cancelled'
+            )
+        )
+        booking_rows = (await db.execute(bookings_query)).all()
+        booking_intervals = [
+            (
+                row[0].astimezone(LOCAL_TIMEZONE) if row[0].tzinfo else row[0].replace(tzinfo=LOCAL_TIMEZONE),
+                row[1].astimezone(LOCAL_TIMEZONE) if row[1].tzinfo else row[1].replace(tzinfo=LOCAL_TIMEZONE)
+            )
+            for row in booking_rows
+        ]
+
     shift_map: dict[tuple[date, str], Shift] = {}
     for shift in shifts:
         if shift.is_cancelled:
@@ -600,17 +624,30 @@ async def get_technician_shift_calendar(
         for period_key in ['morning', 'afternoon']:
             shift = shift_map.get((current_date, period_key))
             if shift:
+                local_start = shift.start_time if shift.start_time.tzinfo else shift.start_time.replace(tzinfo=LOCAL_TIMEZONE)
+                local_end = shift.end_time if shift.end_time.tzinfo else shift.end_time.replace(tzinfo=LOCAL_TIMEZONE)
+                has_bookings = any(
+                    is_overlap(
+                        start,
+                        end,
+                        local_start,
+                        local_end
+                    )
+                    for start, end in booking_intervals
+                )
                 slots[period_key] = schedule_schemas.TechnicianShiftSlot(
                     is_active=True,
                     shift_uid=shift.uid,
                     location_uid=shift.location_id,
                     location_name=shift.location.name if shift.location else None,
-                    locked_by_admin=bool(shift.locked_by_admin)
+                    locked_by_admin=bool(shift.locked_by_admin),
+                    has_bookings=has_bookings
                 )
             else:
                 slots[period_key] = schedule_schemas.TechnicianShiftSlot(
                     is_active=False,
-                    locked_by_admin=False
+                    locked_by_admin=False,
+                    has_bookings=False
                 )
 
         days_payload.append(
