@@ -77,14 +77,6 @@ def infer_shift_period(start: datetime, end: datetime) -> str | None:
 
 def normalize_local_date(dt: datetime) -> date:
     return dt.astimezone(LOCAL_TIMEZONE).date()
-
-
-def normalize_slot_time(dt: datetime) -> str:
-    local_dt = dt.astimezone(LOCAL_TIMEZONE)
-    minute_bucket = (local_dt.minute // 30) * 30
-    normalized = local_dt.replace(minute=minute_bucket, second=0, microsecond=0)
-    return normalized.strftime('%H:%M')
-
 # --- 核心调度算法 ---
 
 async def get_available_slots(
@@ -737,9 +729,12 @@ async def get_location_day_summary(
                 'slots': set()
             })
             info['active'] = True
-            info['slots'].add(
-                normalize_slot_time(shift.start_time)
-            )
+            local_start = shift.start_time.astimezone(LOCAL_TIMEZONE)
+            local_end = shift.end_time.astimezone(LOCAL_TIMEZONE)
+            cursor = local_start
+            while cursor < local_end:
+                info['slots'].add(cursor.strftime('%H:%M'))
+                cursor += timedelta(hours=1)
 
         if period in ('morning', 'afternoon'):
             append_slot(period)
