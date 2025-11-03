@@ -8,7 +8,12 @@ from typing import List, Optional
 from datetime import date
 
 from src.core.database import get_db
-from src.shared.models.resource_models import Location, Service, Resource
+from src.shared.models.resource_models import (
+    Location,
+    Service,
+    Resource,
+    resource_service_link_table,
+)
 from src.shared.models.schedule_models import Shift
 from sqlalchemy.orm import joinedload
 from src.modules.auth.security import get_current_admin_user # 2. 导入管理员依赖
@@ -292,12 +297,24 @@ async def delete_service(
             detail="该服务已关联预约记录，无法删除"
         )
 
+    has_resource_bindings = (await db.execute(
+        select(resource_service_link_table.c.resource_id)
+        .where(resource_service_link_table.c.service_id == service_uid)
+        .limit(1)
+    )).scalars().first()
+    if has_resource_bindings:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="该服务仍绑定在资源上，无法删除"
+        )
+
     await db.execute(
         delete(technician_service_link_table).where(
             technician_service_link_table.c.service_id == service_uid
         )
     )
 
+    db_service.resources = []
     await db.delete(db_service)
     await db.commit()
 
@@ -335,15 +352,35 @@ async def create_resource(
     else:
         resolved_type = str(incoming_type or schemas.ResourceType.room.value)
 
+    # 2. 解析资源类型
     new_resource = Resource(
         name=resource_data.name,
         type=resolved_type,
         location=db_location  # <-- 直接关联对象
     )
+    # 3. 绑定服务能力
+    service_uids = list(dict.fromkeys(resource_data.service_uids or []))
+    if not service_uids:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="请至少选择一个可提供的服务"
+        )
+    service_query = select(Service).where(Service.uid.in_(service_uids))
+    service_result = await db.execute(service_query)
+    services = service_result.scalars().all()
+    found_service_uids = {service.uid for service in services}
+    missing = set(service_uids) - found_service_uids
+    if missing:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"以下服务不存在: {', '.join(sorted(missing))}"
+        )
+    new_resource.services = services
+
     db.add(new_resource)
     await db.commit()
-    # 确保 location 关系在返回前已加载，避免 Lazy Load 触发 MissingGreenlet
-    await db.refresh(new_resource, attribute_names=["location"])
+    # 确保关联关系在返回前已加载，避免 Lazy Load 触发 MissingGreenlet
+    await db.refresh(new_resource, attribute_names=["location", "services"])
     
     # 3. 返回。因为 location 关系是在 session 中被赋的，
     # Pydantic (with from_attributes=True) 可以正确地嵌套 LocationPublic
@@ -367,7 +404,7 @@ async def get_resources_for_location(
         .where(Resource.location_id == location_uid)
         # 关键: 必须 Eager Load 'location' 关系
         # 否则 ResourcePublic schema 会因为缺少 location 数据而失败
-        .options(joinedload(Resource.location))
+        .options(joinedload(Resource.location), joinedload(Resource.services))
         .order_by(Resource.name)
     )
     result = await db.execute(query)
@@ -392,7 +429,7 @@ async def update_resource(
     query = (
         select(Resource)
         .where(Resource.uid == resource_uid)
-        .options(joinedload(Resource.location)) # 预加载以便返回
+        .options(joinedload(Resource.location), joinedload(Resource.services)) # 预加载以便返回
     )
     result = await db.execute(query)
     db_resource = result.scalars().first()
@@ -404,6 +441,7 @@ async def update_resource(
         )
     
     update_data = resource_data.model_dump(exclude_unset=True)
+    service_uids_update = update_data.pop("service_uids", None)
     
     # 检查是否需要更新 location_uid
     if "location_uid" in update_data:
@@ -428,10 +466,29 @@ async def update_resource(
                 setattr(db_resource, key, str(value))
         else:
             setattr(db_resource, key, value)
+
+    if service_uids_update is not None:
+        service_uids_unique = list(dict.fromkeys(service_uids_update))
+        if not service_uids_unique:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="请至少选择一个可提供的服务"
+            )
+        services_query = select(Service).where(Service.uid.in_(service_uids_unique))
+        services_result = await db.execute(services_query)
+        services = services_result.scalars().all()
+        found_service_uids = {service.uid for service in services}
+        missing = set(service_uids_unique) - found_service_uids
+        if missing:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"以下服务不存在: {', '.join(sorted(missing))}"
+            )
+        db_resource.services = services
         
     db.add(db_resource)
     await db.commit()
-    await db.refresh(db_resource, ["location"]) # 确保 location 关系被刷新
+    await db.refresh(db_resource, ["location", "services"]) # 确保关联关系被刷新
     
     return db_resource
 
@@ -451,7 +508,7 @@ async def delete_resource(
     query = (
         select(Resource)
         .where(Resource.uid == resource_uid)
-        .options(joinedload(Resource.location))
+        .options(joinedload(Resource.location), joinedload(Resource.services))
     )
     result = await db.execute(query)
     db_resource = result.scalars().first()
@@ -473,6 +530,7 @@ async def delete_resource(
             detail="该资源仍被预约记录占用，无法删除"
         )
 
+    db_resource.services = []
     await db.delete(db_resource)
     await db.commit()
 
@@ -493,7 +551,7 @@ async def get_all_technicians(
     """
     query = (
         select(User)
-        .where(User.role == 'technician')
+        .where(User.role.in_(('technician', 'admin')))
         # 关键: 必须 Eager Load 'service' 多对多关系
         # 否则 TechnicianPublic schema 会因为缺少 services 数据而失败
         .options(joinedload(User.service))
@@ -527,7 +585,7 @@ async def assign_service_to_technician(
     result = await db.execute(query)
     db_technician = result.scalars().first()
 
-    if not db_technician or db_technician.role != 'technician':
+    if not db_technician or db_technician.role not in ('technician', 'admin'):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="该技师用户不存在"
@@ -583,7 +641,7 @@ async def remove_service_from_technician(
     result = await db.execute(query)
     db_technician = result.scalars().first()
 
-    if not db_technician or db_technician.role != 'technician':
+    if not db_technician or db_technician.role not in ('technician', 'admin'):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="该技师用户不存在"
@@ -635,7 +693,7 @@ async def create_shift(
     db_technician = (await db.execute(
         select(User).where(User.uid == shift_data.technician_uid)
     )).scalars().first()
-    if not db_technician or db_technician.role != 'technician':
+    if not db_technician or db_technician.role not in ('technician', 'admin'):
         raise HTTPException(status_code=404, detail="技师用户不存在")
 
     # 2. 验证地点是否存在

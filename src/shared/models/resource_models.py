@@ -1,7 +1,7 @@
 # src/shared/models/resource_models.py
 
 from __future__ import annotations
-from sqlalchemy import Column, Integer, String, Enum, ForeignKey
+from sqlalchemy import Column, Integer, String, Enum, ForeignKey, Table
 from sqlalchemy.orm import relationship, Mapped, mapped_column
 from src.core.database import Base
 from .user_models import technician_service_link_table # 这个 import 保持不变
@@ -40,6 +40,11 @@ class Resource(Base):
     location_id: Mapped[str] = mapped_column(String(26), ForeignKey("locations.uid"))
 
     location: Mapped["Location"] = relationship("Location", back_populates="resources")
+    services: Mapped[list["Service"]] = relationship(
+        "Service",
+        secondary=lambda: resource_service_link_table,
+        back_populates="resources"
+    )
     
 class Service(Base):
     __tablename__ = "services"
@@ -53,3 +58,16 @@ class Service(Base):
     technicians: Mapped[list["User"]] = relationship(
         "User", secondary=technician_service_link_table, back_populates="service"
     )
+    resources: Mapped[list["Resource"]] = relationship(
+        "Resource",
+        secondary=lambda: resource_service_link_table,
+        back_populates="services"
+    )
+
+
+resource_service_link_table = Table(
+    "resource_service_link",
+    Base.metadata,
+    Column("resource_id", String(26), ForeignKey("resources.uid"), primary_key=True),
+    Column("service_id", String(26), ForeignKey("services.uid"), primary_key=True),
+)

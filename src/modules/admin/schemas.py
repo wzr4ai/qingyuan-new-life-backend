@@ -88,6 +88,7 @@ class ResourceCreate(ResourceBase):
     用于 '创建资源' 接口
     """
     location_uid: str # 必须指定这个资源属于哪个地点
+    service_uids: List[str] = []
 
 class ResourceUpdate(BaseModel):
     """
@@ -96,6 +97,7 @@ class ResourceUpdate(BaseModel):
     name: Optional[str] = None
     location_uid: Optional[str] = None # 允许移动资源到另一个地点
     type: Optional[ResourceType] = None
+    service_uids: Optional[List[str]] = None
 
 class ResourcePublic(ResourceBase):
     """
@@ -104,6 +106,7 @@ class ResourcePublic(ResourceBase):
     uid: str
     name: str
     location: LocationPublic 
+    services: List[ServicePublic] = []
     model_config = ConfigDict(from_attributes=True)
 
 class UserBaseInfo(BaseModel):
