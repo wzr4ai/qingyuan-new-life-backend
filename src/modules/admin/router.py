@@ -408,7 +408,7 @@ async def get_resources_for_location(
         .order_by(Resource.name)
     )
     result = await db.execute(query)
-    resources = result.scalars().all()
+    resources = result.unique().scalars().all()
     
     return resources
 
@@ -432,7 +432,7 @@ async def update_resource(
         .options(joinedload(Resource.location), joinedload(Resource.services)) # 预加载以便返回
     )
     result = await db.execute(query)
-    db_resource = result.scalars().first()
+    db_resource = result.unique().scalars().first()
 
     if not db_resource:
         raise HTTPException(
@@ -511,7 +511,7 @@ async def delete_resource(
         .options(joinedload(Resource.location), joinedload(Resource.services))
     )
     result = await db.execute(query)
-    db_resource = result.scalars().first()
+    db_resource = result.unique().scalars().first()
 
     if not db_resource:
         raise HTTPException(
@@ -583,7 +583,7 @@ async def assign_service_to_technician(
         .options(joinedload(User.service)) # 必须预加载才能 .append()
     )
     result = await db.execute(query)
-    db_technician = result.scalars().first()
+    db_technician = result.unique().scalars().first()
 
     if not db_technician or db_technician.role not in ('technician', 'admin'):
         raise HTTPException(
@@ -639,7 +639,7 @@ async def remove_service_from_technician(
         .options(joinedload(User.service))
     )
     result = await db.execute(query)
-    db_technician = result.scalars().first()
+    db_technician = result.unique().scalars().first()
 
     if not db_technician or db_technician.role not in ('technician', 'admin'):
         raise HTTPException(
