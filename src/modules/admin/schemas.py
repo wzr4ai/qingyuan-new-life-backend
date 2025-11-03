@@ -2,6 +2,7 @@
 
 from pydantic import BaseModel, ConfigDict
 from typing import Optional, List
+from enum import Enum as PyEnum
 from datetime import datetime
 
 # --- Location Schemas ---
@@ -71,11 +72,16 @@ class ServicePublic(ServiceBase):
     buffer_time: int
     model_config = ConfigDict(from_attributes=True)
     
+class ResourceType(str, PyEnum):
+    technician = "technician"
+    room = "room"
+
 class ResourceBase(BaseModel):
     """
     物理资源的基础模型 (床位/房间)
     """
     name: str
+    type: ResourceType = ResourceType.room
 
 class ResourceCreate(ResourceBase):
     """
@@ -89,6 +95,7 @@ class ResourceUpdate(BaseModel):
     """
     name: Optional[str] = None
     location_uid: Optional[str] = None # 允许移动资源到另一个地点
+    type: Optional[ResourceType] = None
 
 class ResourcePublic(ResourceBase):
     """
