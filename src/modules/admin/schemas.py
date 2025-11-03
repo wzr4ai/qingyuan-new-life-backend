@@ -1,6 +1,6 @@
 # src/modules/admin/schemas.py
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, AliasChoices
 from typing import Optional, List, Literal
 from enum import Enum as PyEnum
 from datetime import datetime
@@ -123,9 +123,12 @@ class TechnicianPublic(UserBaseInfo):
     """
     用于 '返回技师' 接口 (包含其技能列表)
     """
-    # 嵌套 ServicePublic 列表，展示该技师的所有技能
-    services: List[ServicePublic] = [] 
-    model_config = ConfigDict(from_attributes=True)
+    # 使用 validation_alias 以兼容 SQLAlchemy 上的 `service` 关系名称
+    services: List[ServicePublic] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices('service', 'services')
+    )
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
 
 class TechnicianSkillAssign(BaseModel):
     """
