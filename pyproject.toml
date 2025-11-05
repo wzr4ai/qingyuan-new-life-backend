@@ -3,7 +3,7 @@ name = "backend"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.13.0"
 dependencies = [
     "cos-python-sdk-v5>=1.9.38",
     "fastapi>=0.119.0",
@@ -23,4 +23,12 @@ dependencies = [
     "psutil>=7.1.1",
     "passlib[bcrypt]>=1.7.4",
     "argon2-cffi>=25.1.0",
+]
+
+[dependency-groups]
+test = [
+    "asgi-lifespan>=2.1.0",
+    "httpx>=0.28.1",
+    "pytest>=8.4.2",
+    "pytest-asyncio>=1.2.0",
 ]
