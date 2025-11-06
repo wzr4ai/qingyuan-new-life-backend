@@ -346,6 +346,7 @@ async def get_available_slots(
                 continue
 
             found_tech = True
+            increment_counts(tech.uid, slot_start)
             break
 
         if not found_tech:
@@ -537,6 +538,13 @@ async def get_available_slots_for_package(
                 tech_period_booking_counts[(tech_uid, period_key)] += 1
             tech_daily_booking_counts[tech_uid] += 1
 
+    def increment_counts(tech_uid: str, slot_start: datetime):
+        local_start = slot_start.astimezone(LOCAL_TIMEZONE)
+        period_name = resolve_period_for_datetime(local_start)
+        if period_name:
+            tech_period_booking_counts[(tech_uid, period_name)] += 1
+        tech_daily_booking_counts[tech_uid] += 1
+
     if holds:
         for hold in holds:
             start = hold.start_time if isinstance(hold.start_time, datetime) else datetime.fromisoformat(str(hold.start_time))
@@ -551,10 +559,7 @@ async def get_available_slots_for_package(
                         end_time=end
                     )
                 )
-                period_key = resolve_period_for_datetime(start)
-                if period_key:
-                    tech_period_booking_counts[(hold.technician_uid, period_key)] += 1
-                tech_daily_booking_counts[hold.technician_uid] += 1
+                increment_counts(hold.technician_uid, start)
             if hold.resource_uid:
                 room_bookings_map[hold.resource_uid].append(
                     SimpleNamespace(
@@ -687,6 +692,7 @@ async def get_available_slots_for_package(
                         price=price
                     )
                 )
+                increment_counts(technician.uid, slot_start)
                 break
 
             if available_slot_payloads and available_slot_payloads[-1].start_time == slot_start:
