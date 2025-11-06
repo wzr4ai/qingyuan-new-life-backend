@@ -199,11 +199,14 @@ async def get_location_technicians(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    return await schedule_service.list_technicians_for_location_services(
-        db=db,
-        location_uid=payload.location_uid,
-        service_uids=payload.service_uids
-    )
+    try:
+        return await schedule_service.list_technicians_for_location_services(
+            db=db,
+            location_uid=payload.location_uid,
+            service_uids=payload.service_uids
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
 
 @router.post(

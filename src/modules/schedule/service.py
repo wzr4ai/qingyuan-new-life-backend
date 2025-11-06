@@ -3,7 +3,7 @@
 from collections import defaultdict
 from datetime import date, datetime, time, timedelta, timezone
 from types import SimpleNamespace
-from typing import Iterable
+from typing import Iterable, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy.orm import joinedload
@@ -15,6 +15,7 @@ from src.shared.models.schedule_models import Shift
 from src.shared.models.appointment_models import AppointmentTechnicianLink, AppointmentResourceLink, Appointment
 
 from .schemas import AppointmentCreate
+from . import business_rules
 
 # 默认的时间槽长度（分钟）
 DEFAULT_SLOT_INTERVAL_MINUTES = 60
@@ -77,6 +78,23 @@ def infer_shift_period(start: datetime, end: datetime) -> str | None:
 
 def normalize_local_date(dt: datetime) -> date:
     return dt.astimezone(LOCAL_TIMEZONE).date()
+
+
+def resolve_period_for_datetime(dt: datetime) -> Optional[str]:
+    """Identify the configured period (morning/afternoon) for the given datetime."""
+    local_dt = dt.astimezone(LOCAL_TIMEZONE)
+    for period_key, config in DEFAULT_SHIFT_PERIODS.items():
+        start_dt = datetime.combine(local_dt.date(), config["start"], tzinfo=LOCAL_TIMEZONE)
+        end_dt = datetime.combine(local_dt.date(), config["end"], tzinfo=LOCAL_TIMEZONE)
+        if start_dt <= local_dt < end_dt:
+            return period_key
+    return None
+
+
+def ensure_timezone(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=LOCAL_TIMEZONE)
+    return value.astimezone(LOCAL_TIMEZONE)
 # --- 核心调度算法 ---
 
 async def get_available_slots(
@@ -170,6 +188,8 @@ async def get_available_slots(
     # ----------------------------------------------------
     
     # a. 技师的预约
+    policies_map = await business_rules.load_technician_policies(db, qualified_tech_uids, location_uid)
+
     tech_bookings_query = select(AppointmentTechnicianLink).where(
         AppointmentTechnicianLink.technician_id.in_(qualified_tech_uids),
         AppointmentTechnicianLink.start_time < day_end,
@@ -190,6 +210,23 @@ async def get_available_slots(
     room_bookings_map = defaultdict(list)
     for booking in room_bookings:
         room_bookings_map[booking.resource_id].append(booking)
+
+    tech_period_booking_counts: dict[tuple[str, str], int] = defaultdict(int)
+    tech_daily_booking_counts: dict[str, int] = defaultdict(int)
+    for tech_uid, bookings in tech_bookings_map.items():
+        for booking in bookings:
+            local_start = ensure_timezone(booking.start_time)
+            period_key = resolve_period_for_datetime(local_start)
+            if period_key:
+                tech_period_booking_counts[(tech_uid, period_key)] += 1
+            tech_daily_booking_counts[tech_uid] += 1
+
+    def increment_counts(tech_uid: str, start: datetime):
+        local_start = ensure_timezone(start)
+        period_key = resolve_period_for_datetime(local_start)
+        if period_key:
+            tech_period_booking_counts[(tech_uid, period_key)] += 1
+        tech_daily_booking_counts[tech_uid] += 1
 
     # ----------------------------------------------------
     # 步骤 6: 基于排班生成候选时间槽
@@ -225,6 +262,38 @@ async def get_available_slots(
     if not candidate_slots:
         return []
 
+    if holds:
+        for hold in holds:
+            start = hold.start_time if isinstance(hold.start_time, datetime) else datetime.fromisoformat(str(hold.start_time))
+            end = hold.end_time if isinstance(hold.end_time, datetime) else datetime.fromisoformat(str(hold.end_time))
+            start = ensure_timezone(start)
+            end = ensure_timezone(end)
+
+            if hold.technician_uid:
+                tech_bookings_map[hold.technician_uid].append(
+                    SimpleNamespace(
+                        start_time=start,
+                        end_time=end
+                    )
+                )
+                increment_counts(hold.technician_uid, start)
+            if hold.resource_uid:
+                room_bookings_map[hold.resource_uid].append(
+                    SimpleNamespace(
+                        start_time=start,
+                        end_time=end
+                    )
+                )
+
+    sorted_technicians = sorted(
+        qualified_technicians,
+        key=lambda tech: (
+            policies_map.get(tech.uid, business_rules.default_policy).priority,
+            tech.nickname or "",
+            tech.uid
+        )
+    )
+
     available_slots: list[str] = []
     for slot_start in sorted(candidate_slots):
         slot_start = slot_start.astimezone(LOCAL_TIMEZONE)
@@ -237,8 +306,23 @@ async def get_available_slots(
         if total_room_duration == timedelta():
             slot_end_for_room = slot_start + slot_step_delta
 
+        slot_period = resolve_period_for_datetime(slot_start)
+
         found_tech = False
-        for tech in qualified_technicians:
+        for tech in sorted_technicians:
+            policy = policies_map.get(tech.uid, business_rules.default_policy)
+            if not policy.allow_public_booking:
+                continue
+
+            period_quota = business_rules.get_period_quota(policy, slot_period)
+            if period_quota is not None and slot_period:
+                if tech_period_booking_counts[(tech.uid, slot_period)] >= period_quota:
+                    continue
+
+            if policy.max_daily is not None:
+                if tech_daily_booking_counts[tech.uid] >= policy.max_daily:
+                    continue
+
             on_shift = any(
                 shift.location_id == location_uid and
                 shift.start_time <= slot_start and
@@ -305,6 +389,13 @@ async def get_available_slots_for_package(
 
     if not ordered_services:
         return []
+
+    location_row = await db.execute(
+        select(Location).where(Location.uid == location_uid)
+    )
+    location = location_row.scalars().first()
+    if not location:
+        raise ValueError("指定的地点不存在")
 
     service_uids = [service.uid for service in ordered_services]
 
@@ -396,34 +487,62 @@ async def get_available_slots_for_package(
     if not capable_technicians:
         return []
 
-    tech_bookings_query = select(AppointmentTechnicianLink).where(
-        AppointmentTechnicianLink.technician_id.in_([tech.uid for tech in capable_technicians]),
-        AppointmentTechnicianLink.start_time < day_end,
-        AppointmentTechnicianLink.end_time > day_start
+    technician_ids = [tech.uid for tech in capable_technicians]
+    policies_map = await business_rules.load_technician_policies(db, technician_ids, location_uid)
+    pricing_map = await business_rules.load_pricing_rules(
+        db=db,
+        service_ids=service_uids,
+        technician_ids=technician_ids,
+        location_uid=location_uid,
+    )
+
+    tech_bookings_query = (
+        select(AppointmentTechnicianLink)
+        .join(Appointment, Appointment.uid == AppointmentTechnicianLink.appointment_id)
+        .where(
+            AppointmentTechnicianLink.technician_id.in_(technician_ids),
+            AppointmentTechnicianLink.start_time < day_end,
+            AppointmentTechnicianLink.end_time > day_start,
+            Appointment.location_id == location_uid,
+            Appointment.status != 'cancelled'
+        )
     )
     tech_bookings = (await db.execute(tech_bookings_query)).scalars().all()
     tech_bookings_map = defaultdict(list)
     for booking in tech_bookings:
         tech_bookings_map[booking.technician_id].append(booking)
 
-    room_bookings_query = select(AppointmentResourceLink).where(
-        AppointmentResourceLink.resource_id.in_(qualified_resource_ids),
-        AppointmentResourceLink.start_time < day_end,
-        AppointmentResourceLink.end_time > day_start
+    room_bookings_query = (
+        select(AppointmentResourceLink)
+        .join(Appointment, Appointment.uid == AppointmentResourceLink.appointment_id)
+        .where(
+            AppointmentResourceLink.resource_id.in_(qualified_resource_ids),
+            AppointmentResourceLink.start_time < day_end,
+            AppointmentResourceLink.end_time > day_start,
+            Appointment.status != 'cancelled'
+        )
     )
     room_bookings = (await db.execute(room_bookings_query)).scalars().all()
     room_bookings_map = defaultdict(list)
     for booking in room_bookings:
         room_bookings_map[booking.resource_id].append(booking)
 
+    tech_period_booking_counts: dict[tuple[str, str], int] = defaultdict(int)
+    tech_daily_booking_counts: dict[str, int] = defaultdict(int)
+    for tech_uid, bookings in tech_bookings_map.items():
+        for booking in bookings:
+            local_start = ensure_timezone(booking.start_time)
+            period_key = resolve_period_for_datetime(local_start)
+            if period_key:
+                tech_period_booking_counts[(tech_uid, period_key)] += 1
+            tech_daily_booking_counts[tech_uid] += 1
+
     if holds:
         for hold in holds:
             start = hold.start_time if isinstance(hold.start_time, datetime) else datetime.fromisoformat(str(hold.start_time))
             end = hold.end_time if isinstance(hold.end_time, datetime) else datetime.fromisoformat(str(hold.end_time))
-            if start.tzinfo is None:
-                start = start.replace(tzinfo=LOCAL_TIMEZONE)
-            if end.tzinfo is None:
-                end = end.replace(tzinfo=LOCAL_TIMEZONE)
+            start = ensure_timezone(start)
+            end = ensure_timezone(end)
 
             if hold.technician_uid:
                 tech_bookings_map[hold.technician_uid].append(
@@ -432,6 +551,10 @@ async def get_available_slots_for_package(
                         end_time=end
                     )
                 )
+                period_key = resolve_period_for_datetime(start)
+                if period_key:
+                    tech_period_booking_counts[(hold.technician_uid, period_key)] += 1
+                tech_daily_booking_counts[hold.technician_uid] += 1
             if hold.resource_uid:
                 room_bookings_map[hold.resource_uid].append(
                     SimpleNamespace(
@@ -460,13 +583,53 @@ async def get_available_slots_for_package(
     if not candidate_slots:
         return []
 
+    technician_contexts = []
+    for technician in capable_technicians:
+        policy = policies_map.get(technician.uid, business_rules.default_policy)
+        if not policy.allow_public_booking:
+            continue
+        technician_contexts.append({
+            "technician": technician,
+            "policy": policy,
+            "priority": policy.priority,
+        })
+
+    if preferred_technician_uid:
+        technician_contexts = [
+            ctx for ctx in technician_contexts
+            if ctx["technician"].uid == preferred_technician_uid
+        ]
+        if not technician_contexts:
+            return []
+    else:
+        technician_contexts.sort(
+            key=lambda ctx: (
+                ctx["priority"],
+                ctx["technician"].nickname or "",
+                ctx["technician"].uid
+            )
+        )
+
     available_slot_payloads: list[schedule_schemas.PackageAvailabilitySlot] = []
 
     for slot_start in sorted(candidate_slots):
         slot_end_for_tech = slot_start + total_tech_duration
         slot_end_for_room = slot_start + total_room_duration
+        period_key = resolve_period_for_datetime(slot_start)
 
-        for technician in capable_technicians:
+        for ctx in technician_contexts:
+            technician = ctx["technician"]
+            policy = ctx["policy"]
+
+            period_quota = business_rules.get_period_quota(policy, period_key)
+            if period_quota is not None and period_key:
+                if tech_period_booking_counts[(technician.uid, period_key)] >= period_quota:
+                    continue
+
+            if policy.max_daily is not None:
+                if tech_daily_booking_counts[technician.uid] >= policy.max_daily:
+                    continue
+
             on_shift = any(
                 shift.start_time.astimezone(LOCAL_TIMEZONE) <= slot_start and
                 shift.end_time.astimezone(LOCAL_TIMEZONE) >= slot_end_for_tech
@@ -502,6 +665,13 @@ async def get_available_slots_for_package(
                 if is_room_booked:
                     continue
 
+                price = business_rules.calculate_total_price(
+                    pricing_map=pricing_map,
+                    service_ids=service_uids,
+                    technician_id=technician.uid,
+                    location_id=location.uid if location else None,
+                )
+
                 available_slot_payloads.append(
                     schedule_schemas.PackageAvailabilitySlot(
                         start_time=slot_start,
@@ -513,7 +683,8 @@ async def get_available_slots_for_package(
                         resource=schedule_schemas.PackageSlotResource(
                             uid=resource.uid,
                             name=resource.name
-                        )
+                        ),
+                        price=price
                     )
                 )
                 break
@@ -540,6 +711,13 @@ async def create_appointment(
     if not db_service:
         raise Exception("服务项目不存在")
 
+    location_row = await db.execute(
+        select(Location).where(Location.uid == appt_data.location_uid)
+    )
+    location = location_row.scalars().first()
+    if not location:
+        raise Exception("预约地点不存在")
+
     slot_step_minutes = get_slot_interval_minutes(db_service)
     slot_step_delta = timedelta(minutes=slot_step_minutes)
 
@@ -553,20 +731,27 @@ async def create_appointment(
     # ----------------------------------------------------
     # 步骤 3: 确定预约的时间范围
     # ----------------------------------------------------
-    appt_start = appt_data.start_time
+    appt_start = ensure_timezone(appt_data.start_time)
     appt_tech_end = appt_start + total_tech_duration
     if total_room_duration == timedelta():
         total_room_duration = slot_step_delta
     appt_room_end = appt_start + total_room_duration
 
     # ----------------------------------------------------
-    # 步骤 4.1: 查找空闲的合格技师
+    # 步骤 4.1: 查找空闲的合格技师（含优先级与限额）
     # ----------------------------------------------------
-    capable_tech_uids = [
-        tech.uid for tech in (await db.execute(
-            select(User).join(User.service).where(Service.uid == appt_data.service_uid)
-        )).scalars().all()
-    ]
+    tech_query = (
+        select(User)
+        .options(joinedload(User.service))
+        .where(
+            User.role.in_(("technician", "admin")),
+            User.service.any(Service.uid == appt_data.service_uid)
+        )
+    )
+    technicians = (await db.execute(tech_query)).scalars().unique().all()
+
+    if not technicians:
+        raise Exception("暂无可执行该服务的技师")
 
     required_tech_end = appt_start + total_tech_duration
     if total_tech_duration == timedelta():
@@ -576,38 +761,116 @@ async def create_appointment(
         select(Shift)
         .options(joinedload(Shift.technician))
         .where(
-            Shift.technician_id.in_(capable_tech_uids),
+            Shift.technician_id.in_([tech.uid for tech in technicians]),
             Shift.location_id == appt_data.location_uid,
             Shift.is_cancelled == False,
             Shift.start_time <= appt_start,
             Shift.end_time >= required_tech_end
         )
-        .order_by(Shift.start_time)
     )
-    candidate_shifts = (await db.execute(shift_query)).scalars().all()
+    shifts = (await db.execute(shift_query)).scalars().all()
 
-    if not candidate_shifts:
-        raise Exception("没有技师在此时间排班或排班时间不足")
+    shift_map = defaultdict(list)
+    for shift in shifts:
+        shift_map[shift.technician_id].append(shift)
 
-    candidate_tech_ids = [shift.technician_id for shift in candidate_shifts]
+    capable_technicians = [tech for tech in technicians if shift_map.get(tech.uid)]
+    if not capable_technicians:
+        raise Exception("该时间段无排班技师")
 
-    booked_techs_query = select(AppointmentTechnicianLink.technician_id).where(
-        AppointmentTechnicianLink.technician_id.in_(candidate_tech_ids),
-        AppointmentTechnicianLink.start_time < (required_tech_end if total_tech_duration > timedelta() else appt_start),
-        AppointmentTechnicianLink.end_time > appt_start
+    technician_ids = [tech.uid for tech in capable_technicians]
+    policies_map = await business_rules.load_technician_policies(db, technician_ids, appt_data.location_uid)
+
+    technician_contexts = []
+    for technician in capable_technicians:
+        policy = policies_map.get(technician.uid, business_rules.default_policy)
+        if not policy.allow_public_booking:
+            continue
+        technician_contexts.append({
+            "technician": technician,
+            "policy": policy,
+            "priority": policy.priority,
+        })
+
+    if not technician_contexts:
+        raise Exception("当前时间段无可预约技师")
+
+    technician_contexts.sort(
+        key=lambda ctx: (
+            ctx["priority"],
+            ctx["technician"].nickname or "",
+            ctx["technician"].uid
+        )
     )
-    booked_tech_ids = set((await db.execute(booked_techs_query)).scalars().all())
 
-    chosen_shift: Shift | None = None
-    for shift in candidate_shifts:
-        if shift.technician_id not in booked_tech_ids:
-            chosen_shift = shift
-            break
+    tech_bookings_query = (
+        select(AppointmentTechnicianLink)
+        .join(Appointment, Appointment.uid == AppointmentTechnicianLink.appointment_id)
+        .where(
+            AppointmentTechnicianLink.technician_id.in_([ctx["technician"].uid for ctx in technician_contexts]),
+            AppointmentTechnicianLink.start_time < (required_tech_end if total_tech_duration > timedelta() else appt_start),
+            AppointmentTechnicianLink.end_time > appt_start,
+            Appointment.location_id == appt_data.location_uid,
+            Appointment.status != 'cancelled'
+        )
+    )
+    tech_bookings = (await db.execute(tech_bookings_query)).scalars().all()
+    tech_bookings_map = defaultdict(list)
+    for booking in tech_bookings:
+        tech_bookings_map[booking.technician_id].append(booking)
 
-    if not chosen_shift:
-        raise Exception("该时间段的技师已被预约，请选择其他时间")
+    tech_period_booking_counts: dict[tuple[str, str], int] = defaultdict(int)
+    tech_daily_booking_counts: dict[str, int] = defaultdict(int)
+    for tech_uid, bookings in tech_bookings_map.items():
+        for booking in bookings:
+            local_start = ensure_timezone(booking.start_time)
+            booking_period = resolve_period_for_datetime(local_start)
+            if booking_period:
+                tech_period_booking_counts[(tech_uid, booking_period)] += 1
+            tech_daily_booking_counts[tech_uid] += 1
 
-    available_technician = chosen_shift.technician
+    period_key = resolve_period_for_datetime(appt_start)
+
+    available_technician: User | None = None
+    for ctx in technician_contexts:
+        technician = ctx["technician"]
+        policy = ctx["policy"]
+
+        period_quota = business_rules.get_period_quota(policy, period_key)
+        if period_quota is not None and period_key:
+            if tech_period_booking_counts[(technician.uid, period_key)] >= period_quota:
+                continue
+
+        if policy.max_daily is not None:
+            if tech_daily_booking_counts[technician.uid] >= policy.max_daily:
+                continue
+
+        on_shift = any(
+            ensure_timezone(shift.start_time) <= appt_start and
+            ensure_timezone(shift.end_time) >= required_tech_end
+            for shift in shift_map.get(technician.uid, [])
+        )
+        if not on_shift:
+            continue
+
+        bookings = tech_bookings_map.get(technician.uid, [])
+        is_conflicted = any(
+            is_overlap(
+                ensure_timezone(booking.start_time),
+                ensure_timezone(booking.end_time),
+                appt_start,
+                required_tech_end if total_tech_duration > timedelta() else appt_start
+            )
+            for booking in bookings
+        )
+        if is_conflicted:
+            continue
+
+        available_technician = technician
+        break
+
+    if not available_technician:
+        raise Exception("该时间段的技师预约名额已满，请选择其他时间")
 
     # ----------------------------------------------------
     # 步骤 4.2: (重构) 查找空闲的合格房间
@@ -621,11 +884,15 @@ async def create_appointment(
     if not qualified_rooms:
         raise Exception("该地点没有可用的房间/床位")
 
-    booked_rooms_query = select(AppointmentResourceLink.resource_id).where(
-        AppointmentResourceLink.resource_id.in_([r.uid for r in qualified_rooms]),
-        # 检查时间重叠
-        AppointmentResourceLink.start_time < appt_room_end,
-        AppointmentResourceLink.end_time > appt_start
+    booked_rooms_query = (
+        select(AppointmentResourceLink.resource_id)
+        .join(Appointment, Appointment.uid == AppointmentResourceLink.appointment_id)
+        .where(
+            AppointmentResourceLink.resource_id.in_([r.uid for r in qualified_rooms]),
+            AppointmentResourceLink.start_time < appt_room_end,
+            AppointmentResourceLink.end_time > appt_start,
+            Appointment.status != 'cancelled'
+        )
     )
     booked_room_ids = (await db.execute(booked_rooms_query)).scalars().all()
 
@@ -810,6 +1077,18 @@ async def list_technicians_for_location_services(
 
     requested_service_set = {uid for uid in service_uids if uid}
 
+    location_row = await db.execute(select(Location).where(Location.uid == location_uid))
+    location = location_row.scalars().first()
+    if not location:
+        raise ValueError("地点不存在")
+
+    requested_services: list[Service] = []
+    if requested_service_set:
+        services_rows = await db.execute(
+            select(Service).where(Service.uid.in_(requested_service_set))
+        )
+        requested_services = services_rows.scalars().all()
+
     tech_query = (
         select(User)
         .options(joinedload(User.service))
@@ -817,6 +1096,22 @@ async def list_technicians_for_location_services(
         .order_by(User.nickname)
     )
     technicians = (await db.execute(tech_query)).scalars().unique().all()
+
+    service_id_list: list[str] = [service.uid for service in requested_services] if requested_services else []
+    pricing_map = {}
+    if service_id_list:
+        pricing_map = await business_rules.load_pricing_rules(
+            db=db,
+            service_ids=service_id_list,
+            technician_ids=[tech.uid for tech in technicians],
+            location_uid=location_uid,
+        )
+
+    policies_map = await business_rules.load_technician_policies(
+        db=db,
+        technician_ids=[tech.uid for tech in technicians],
+        location_uid=location_uid,
+    )
 
     now_dt = datetime.now(LOCAL_TIMEZONE)
     shift_rows = await db.execute(
@@ -842,13 +1137,29 @@ async def list_technicians_for_location_services(
         elif has_all_services and not available_for_location:
             disabled_reason = "近期无排班"
 
+        policy = policies_map.get(technician.uid, business_rules.default_policy)
+        if not policy.allow_public_booking:
+            is_available = False
+            if not disabled_reason:
+                disabled_reason = "暂不开放线上预约"
+
+        price = None
+        if has_all_services and requested_services:
+            price = business_rules.calculate_total_price(
+                pricing_map=pricing_map,
+                service_ids=service_id_list,
+                technician_id=technician.uid,
+                location_id=location.uid,
+            )
+
         options.append(
             schedule_schemas.TechnicianOption(
                 uid=technician.uid,
                 nickname=technician.nickname,
                 phone=technician.phone,
                 is_available=is_available,
-                disabled_reason=disabled_reason
+                disabled_reason=disabled_reason,
+                price=price
             )
         )
 

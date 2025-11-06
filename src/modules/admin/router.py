@@ -14,7 +14,7 @@ from src.shared.models.resource_models import (
     Resource,
     resource_service_link_table,
 )
-from src.shared.models.schedule_models import Shift
+from src.shared.models.schedule_models import Shift, TechnicianPolicy, TechnicianServicePricing
 from sqlalchemy.orm import joinedload
 from src.modules.auth.security import get_current_admin_user # 2. 导入管理员依赖
 from src.shared.models.user_models import User, technician_service_link_table # 3. 导入 User (用于类型注解)
@@ -731,6 +731,354 @@ async def remove_service_from_technician(
     await db.refresh(db_technician, ["service"])
     
     return db_technician
+
+
+# --- Technician policy management ---
+
+@router.get(
+    "/technicians/policies",
+    response_model=List[schemas.TechnicianPolicyPublic],
+    summary="获取技师预约策略列表"
+)
+async def list_technician_policies(
+    technician_uid: Optional[str] = Query(None, description="筛选指定技师"),
+    location_uid: Optional[str] = Query(None, description="筛选指定地点"),
+    db: AsyncSession = Depends(get_db),
+    admin_user: User = Depends(get_current_admin_user)
+):
+    query = (
+        select(TechnicianPolicy)
+        .options(joinedload(TechnicianPolicy.technician), joinedload(TechnicianPolicy.location))
+        .order_by(TechnicianPolicy.auto_assign_priority, TechnicianPolicy.created_at)
+    )
+    if technician_uid:
+        query = query.where(TechnicianPolicy.technician_id == technician_uid)
+    if location_uid:
+        query = query.where(TechnicianPolicy.location_id == location_uid)
+
+    policies = (await db.execute(query)).scalars().all()
+    return policies
+
+
+@router.post(
+    "/technicians/policies",
+    response_model=schemas.TechnicianPolicyPublic,
+    status_code=status.HTTP_201_CREATED,
+    summary="创建技师预约策略"
+)
+async def create_technician_policy(
+    payload: schemas.TechnicianPolicyCreate,
+    db: AsyncSession = Depends(get_db),
+    admin_user: User = Depends(get_current_admin_user)
+):
+    technician = await db.get(User, payload.technician_uid)
+    if not technician or technician.role not in ("technician", "admin"):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="技师不存在")
+
+    location_id = payload.location_uid or None
+    if location_id:
+        location = await db.get(Location, location_id)
+        if not location:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="地点不存在")
+
+    criteria = [
+        TechnicianPolicy.technician_id == payload.technician_uid,
+    ]
+    if location_id:
+        criteria.append(TechnicianPolicy.location_id == location_id)
+    else:
+        criteria.append(TechnicianPolicy.location_id.is_(None))
+
+    existing = (await db.execute(select(TechnicianPolicy).where(*criteria))).scalars().first()
+    if existing:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="该技师在此地点的策略已存在")
+
+    policy = TechnicianPolicy(
+        technician_id=payload.technician_uid,
+        location_id=location_id,
+        max_daily_online=payload.max_daily_online,
+        max_morning_online=payload.max_morning_online,
+        max_afternoon_online=payload.max_afternoon_online,
+        auto_assign_priority=payload.auto_assign_priority,
+        allow_public_booking=payload.allow_public_booking,
+    )
+    db.add(policy)
+    await db.commit()
+    await db.refresh(policy, ["technician", "location"])
+    return policy
+
+
+@router.put(
+    "/technicians/policies/{policy_uid}",
+    response_model=schemas.TechnicianPolicyPublic,
+    summary="更新技师预约策略"
+)
+async def update_technician_policy(
+    policy_uid: str,
+    payload: schemas.TechnicianPolicyUpdate,
+    db: AsyncSession = Depends(get_db),
+    admin_user: User = Depends(get_current_admin_user)
+):
+    policy = (
+        await db.execute(
+            select(TechnicianPolicy)
+            .options(joinedload(TechnicianPolicy.technician), joinedload(TechnicianPolicy.location))
+            .where(TechnicianPolicy.uid == policy_uid)
+        )
+    ).scalars().first()
+
+    if not policy:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="策略不存在")
+
+    data = payload.model_dump(exclude_unset=True)
+
+    if "location_uid" in data:
+        new_location = data.pop("location_uid")
+        if new_location:
+            location = await db.get(Location, new_location)
+            if not location:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="地点不存在")
+            policy.location_id = new_location
+        else:
+            policy.location_id = None
+
+        criteria = [
+            TechnicianPolicy.technician_id == policy.technician_id,
+        ]
+        if policy.location_id:
+            criteria.append(TechnicianPolicy.location_id == policy.location_id)
+        else:
+            criteria.append(TechnicianPolicy.location_id.is_(None))
+
+        conflict = (
+            await db.execute(
+                select(TechnicianPolicy)
+                .where(*criteria, TechnicianPolicy.uid != policy.uid)
+            )
+        ).scalars().first()
+        if conflict:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="该技师此地点策略已存在")
+
+    for field, value in data.items():
+        setattr(policy, field, value)
+
+    db.add(policy)
+    await db.commit()
+    await db.refresh(policy, ["technician", "location"])
+    return policy
+
+
+@router.delete(
+    "/technicians/policies/{policy_uid}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="删除技师预约策略"
+)
+async def delete_technician_policy(
+    policy_uid: str,
+    db: AsyncSession = Depends(get_db),
+    admin_user: User = Depends(get_current_admin_user)
+):
+    policy = await db.get(TechnicianPolicy, policy_uid)
+    if not policy:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="策略不存在")
+
+    await db.delete(policy)
+    await db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# --- Technician service pricing management ---
+
+@router.get(
+    "/technicians/pricing",
+    response_model=List[schemas.TechnicianServicePricingPublic],
+    summary="获取技师服务定价配置"
+)
+async def list_technician_pricing(
+    technician_uid: Optional[str] = Query(None, description="筛选指定技师"),
+    service_uid: Optional[str] = Query(None, description="筛选指定服务"),
+    location_uid: Optional[str] = Query(None, description="筛选指定地点"),
+    db: AsyncSession = Depends(get_db),
+    admin_user: User = Depends(get_current_admin_user)
+):
+    query = (
+        select(TechnicianServicePricing)
+        .options(
+            joinedload(TechnicianServicePricing.service),
+            joinedload(TechnicianServicePricing.technician),
+            joinedload(TechnicianServicePricing.location),
+        )
+        .order_by(TechnicianServicePricing.service_id, TechnicianServicePricing.technician_id)
+    )
+    if technician_uid:
+        query = query.where(TechnicianServicePricing.technician_id == technician_uid)
+    if service_uid:
+        query = query.where(TechnicianServicePricing.service_id == service_uid)
+    if location_uid:
+        query = query.where(TechnicianServicePricing.location_id == location_uid)
+
+    pricing = (await db.execute(query)).scalars().all()
+    return pricing
+
+
+@router.post(
+    "/technicians/pricing",
+    response_model=schemas.TechnicianServicePricingPublic,
+    status_code=status.HTTP_201_CREATED,
+    summary="创建技师服务定价配置"
+)
+async def create_technician_pricing(
+    payload: schemas.TechnicianServicePricingCreate,
+    db: AsyncSession = Depends(get_db),
+    admin_user: User = Depends(get_current_admin_user)
+):
+    service = await db.get(Service, payload.service_uid)
+    if not service:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="服务不存在")
+
+    technician_id = payload.technician_uid or None
+    if technician_id:
+        technician = await db.get(User, technician_id)
+        if not technician or technician.role not in ("technician", "admin"):
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="技师不存在")
+
+    location_id = payload.location_uid or None
+    if location_id:
+        location = await db.get(Location, location_id)
+        if not location:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="地点不存在")
+
+    criteria = [
+        TechnicianServicePricing.service_id == payload.service_uid,
+    ]
+    if technician_id:
+        criteria.append(TechnicianServicePricing.technician_id == technician_id)
+    else:
+        criteria.append(TechnicianServicePricing.technician_id.is_(None))
+    if location_id:
+        criteria.append(TechnicianServicePricing.location_id == location_id)
+    else:
+        criteria.append(TechnicianServicePricing.location_id.is_(None))
+
+    existing = (await db.execute(select(TechnicianServicePricing).where(*criteria))).scalars().first()
+    if existing:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="定价记录已存在")
+
+    pricing = TechnicianServicePricing(
+        service_id=payload.service_uid,
+        technician_id=technician_id,
+        location_id=location_id,
+        price=payload.price,
+        is_active=payload.is_active,
+    )
+    db.add(pricing)
+    await db.commit()
+    await db.refresh(pricing, ["service", "technician", "location"])
+    return pricing
+
+
+@router.put(
+    "/technicians/pricing/{pricing_uid}",
+    response_model=schemas.TechnicianServicePricingPublic,
+    summary="更新技师服务定价配置"
+)
+async def update_technician_pricing(
+    pricing_uid: str,
+    payload: schemas.TechnicianServicePricingUpdate,
+    db: AsyncSession = Depends(get_db),
+    admin_user: User = Depends(get_current_admin_user)
+):
+    pricing = (
+        await db.execute(
+            select(TechnicianServicePricing)
+            .options(
+                joinedload(TechnicianServicePricing.service),
+                joinedload(TechnicianServicePricing.technician),
+                joinedload(TechnicianServicePricing.location),
+            )
+            .where(TechnicianServicePricing.uid == pricing_uid)
+        )
+    ).scalars().first()
+
+    if not pricing:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="定价记录不存在")
+
+    data = payload.model_dump(exclude_unset=True)
+
+    if "service_uid" in data:
+        service = await db.get(Service, data["service_uid"])
+        if not service:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="服务不存在")
+        pricing.service_id = data.pop("service_uid")
+
+    if "technician_uid" in data:
+        new_tech = data.pop("technician_uid")
+        if new_tech:
+            technician = await db.get(User, new_tech)
+            if not technician or technician.role not in ("technician", "admin"):
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="技师不存在")
+            pricing.technician_id = new_tech
+        else:
+            pricing.technician_id = None
+
+    if "location_uid" in data:
+        new_location = data.pop("location_uid")
+        if new_location:
+            location = await db.get(Location, new_location)
+            if not location:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="地点不存在")
+            pricing.location_id = new_location
+        else:
+            pricing.location_id = None
+
+    criteria = [
+        TechnicianServicePricing.service_id == pricing.service_id,
+    ]
+    if pricing.technician_id:
+        criteria.append(TechnicianServicePricing.technician_id == pricing.technician_id)
+    else:
+        criteria.append(TechnicianServicePricing.technician_id.is_(None))
+    if pricing.location_id:
+        criteria.append(TechnicianServicePricing.location_id == pricing.location_id)
+    else:
+        criteria.append(TechnicianServicePricing.location_id.is_(None))
+
+    conflict = (
+        await db.execute(
+            select(TechnicianServicePricing)
+            .where(*criteria, TechnicianServicePricing.uid != pricing.uid)
+        )
+    ).scalars().first()
+    if conflict:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="定价记录已存在")
+
+    for field, value in data.items():
+        setattr(pricing, field, value)
+
+    db.add(pricing)
+    await db.commit()
+    await db.refresh(pricing, ["service", "technician", "location"])
+    return pricing
+
+
+@router.delete(
+    "/technicians/pricing/{pricing_uid}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="删除技师服务定价配置"
+)
+async def delete_technician_pricing(
+    pricing_uid: str,
+    db: AsyncSession = Depends(get_db),
+    admin_user: User = Depends(get_current_admin_user)
+):
+    pricing = await db.get(TechnicianServicePricing, pricing_uid)
+    if not pricing:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="定价记录不存在")
+
+    await db.delete(pricing)
+    await db.commit()
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
+
 
 @router.post(
     "/shifts",

@@ -191,3 +191,61 @@ class ShiftPublic(BaseModel):
     location: LocationPublic 
     
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+
+
+class TechnicianPolicyBase(BaseModel):
+    technician_uid: str
+    location_uid: Optional[str] = None
+    max_daily_online: Optional[int] = Field(default=None, ge=0)
+    max_morning_online: Optional[int] = Field(default=None, ge=0)
+    max_afternoon_online: Optional[int] = Field(default=None, ge=0)
+    auto_assign_priority: int = Field(default=50)
+    allow_public_booking: bool = True
+
+
+class TechnicianPolicyCreate(TechnicianPolicyBase):
+    pass
+
+
+class TechnicianPolicyUpdate(BaseModel):
+    location_uid: Optional[str] = None
+    max_daily_online: Optional[int] = Field(default=None, ge=0)
+    max_morning_online: Optional[int] = Field(default=None, ge=0)
+    max_afternoon_online: Optional[int] = Field(default=None, ge=0)
+    auto_assign_priority: Optional[int] = None
+    allow_public_booking: Optional[bool] = None
+
+
+class TechnicianPolicyPublic(TechnicianPolicyBase):
+    uid: str
+    technician: Optional[UserBaseInfo] = None
+    location: Optional[LocationPublic] = None
+    model_config = ConfigDict(from_attributes=True)
+
+
+class TechnicianServicePricingBase(BaseModel):
+    service_uid: str
+    technician_uid: Optional[str] = None
+    location_uid: Optional[str] = None
+    price: int = Field(ge=0)
+    is_active: bool = True
+
+
+class TechnicianServicePricingCreate(TechnicianServicePricingBase):
+    pass
+
+
+class TechnicianServicePricingUpdate(BaseModel):
+    service_uid: Optional[str] = None
+    technician_uid: Optional[str] = None
+    location_uid: Optional[str] = None
+    price: Optional[int] = Field(default=None, ge=0)
+    is_active: Optional[bool] = None
+
+
+class TechnicianServicePricingPublic(TechnicianServicePricingBase):
+    uid: str
+    service: Optional[ServicePublic] = None
+    technician: Optional[UserBaseInfo] = None
+    location: Optional[LocationPublic] = None
+    model_config = ConfigDict(from_attributes=True)

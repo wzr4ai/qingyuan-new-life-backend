@@ -113,6 +113,7 @@ class TechnicianOption(BaseModel):
     phone: Optional[str] = None
     is_available: bool = True
     disabled_reason: Optional[str] = None
+    price: Optional[int] = None
 
 
 class TechnicianShiftCreateItem(BaseModel):
@@ -160,6 +161,7 @@ class PackageAvailabilitySlot(BaseModel):
     start_time: datetime
     technician: Optional[PackageSlotTechnician] = None
     resource: Optional[PackageSlotResource] = None
+    price: Optional[int] = None
 
 
 class PackageAvailabilityResponse(BaseModel):
